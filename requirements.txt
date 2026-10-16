@@ -1,0 +1,6 @@
+opencv-python
+PySide6
+mido
+matplotlib
+music21
+python-rtmidi

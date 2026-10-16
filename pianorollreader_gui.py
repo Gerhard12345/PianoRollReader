@@ -28,7 +28,9 @@ from PySide6.QtGui import (
 	QPainter,
 	QPen,
 	QPixmap,
+	QSurfaceFormat,
 )
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -530,9 +532,14 @@ class KeyHitTableModel(QAbstractTableModel):
 		self.endResetModel()
 
 
-class PianoRollTimeline(QWidget):
+class PianoRollTimeline(QOpenGLWidget):
 	def __init__(self, parent=None) -> None:
 		super().__init__(parent)
+		surface_format = self.format()
+		surface_format.setSwapInterval(1)
+		surface_format.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
+		self.setFormat(surface_format)
+		self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.PartialUpdate)
 		self.setMinimumSize(640, 360)
 		self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 		self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -550,6 +557,7 @@ class PianoRollTimeline(QWidget):
 		self.visible_sources: set[str] = set()
 		self.visible_raw_bars: list[dict[str, object]] = []
 		self.visible_corrected_bars: list[dict[str, object]] = []
+		self.active_notes: dict[str, str] = {}
 		self._timeline_initialized = False
 		self.reference_label = "Detection"
 		self.playhead_visible = True
@@ -682,10 +690,10 @@ class PianoRollTimeline(QWidget):
 			return self.visible_corrected_bars
 		return bars
 
-	def paintEvent(self, event) -> None:
+	def paintGL(self) -> None:
 		painter = QPainter(self)
-		dirty = QRectF(event.rect())
-		painter.fillRect(event.rect(), QColor("#0b1218"))
+		dirty = QRectF(self.rect())
+		painter.fillRect(self.rect(), QColor("#0b1218"))
 		painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 		chart = self.chart_rect
 		painter.fillRect(dirty.intersected(QRectF(chart)), QColor("#101a22"))
@@ -724,13 +732,35 @@ class PianoRollTimeline(QWidget):
 					painter.fillRect(QRectF(chart.left(), row_top, chart.width(), row_height), QColor("#14212a"))
 				painter.setPen(QPen(QColor("#253640"), 0.6))
 				painter.drawLine(round(chart.left()), round(chart.bottom() - row * row_height), round(chart.right()), round(chart.bottom() - row * row_height))
-			painter.setPen(QColor("#c2d0d7"))
-			for row, note in enumerate(self.notes):
-				y = chart.bottom() - (row + 0.5) * row_height + font_metrics.ascent() / 2
-				if y < dirty.top() or y > dirty.bottom():
+			for row, note_name in enumerate(self.notes):
+				row_top = chart.bottom() - (row + 1) * row_height
+				row_bottom = chart.bottom() - row * row_height
+				if row_bottom < dirty.top() or row_top > dirty.bottom():
 					continue
-				painter.drawText(4, round(y), 74, font_metrics.height(), Qt.AlignmentFlag.AlignRight, note)
+				midi_note = NOTE_TO_MIDI[note_name]
+				is_white_key = midi_note % 12 in {0, 2, 4, 5, 7, 9, 11}
+				active_hand = self.active_notes.get(note_name)
+				key_color = (
+					"#28a9bd" if active_hand == "left" else "#42a45f"
+				) if active_hand is not None else ("#f1eee4" if is_white_key else "#172027")
+				key_width = 76 if is_white_key else 52
+				key_rect = QRectF(chart.left() - key_width - 18, row_top, key_width, row_height)
+				painter.fillRect(key_rect, QColor(key_color))
+				painter.setPen(QPen(QColor("#52616a" if is_white_key else "#72808a"), 0.8))
+				painter.drawRect(key_rect)
+				painter.setPen(QColor("#172027" if is_white_key else "#f0f5f7"))
+				painter.setFont(QFont(painter.font().family(), 7, QFont.Weight.DemiBold))
+				painter.drawText(
+					key_rect.adjusted(2, 0, -3, 0),
+					Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+					note_name,
+				)
+				if active_hand is not None:
+					painter.setPen(QPen(QColor("#ffe49a"), 1.5))
+					painter.drawRect(key_rect.adjusted(1, 1, -1, -1))
 
+		painter.save()
+		painter.setClipRect(chart)
 		for tick in range(first_tick, last_tick + 1):
 			value = self.origin + tick * sixteenth
 			measure_line = tick % 16 == 0
@@ -742,7 +772,10 @@ class PianoRollTimeline(QWidget):
 			line_width = 2.4 if measure_line else 1.25 if beat_line else 0.6
 			painter.setPen(QPen(QColor(line_color), line_width))
 			painter.drawLine(x, round(chart.top()), x, round(chart.bottom()))
+		painter.restore()
 
+		painter.save()
+		painter.setClipRect(chart)
 		for bar in self._visible_bars(self.raw_bars):
 			rect = self._bar_rect(bar, chart)
 			if not rect.intersects(dirty):
@@ -786,6 +819,7 @@ class PianoRollTimeline(QWidget):
 			if dirty.left() - 2 <= x <= dirty.right() + 2:
 				painter.setPen(QPen(QColor("#ff4b45"), 2.0))
 				painter.drawLine(x, round(chart.top()), x, round(chart.bottom()))
+		painter.restore()
 		if dirty.top() <= 32:
 			legend_x = round(chart.left())
 			legend_entries = [(self.reference_label, "#28a9bd")]
@@ -982,6 +1016,21 @@ class PianoRollTimeline(QWidget):
 				x = round(self._x_pixel(position))
 				self.update(x - 3, round(chart.top()), 7, round(chart.height()))
 
+	def set_active_notes(self, active_notes: dict[str, str]) -> None:
+		if active_notes == self.active_notes:
+			return
+		changed_notes = set(self.active_notes) | set(active_notes)
+		previous_active_notes = self.active_notes
+		self.active_notes = active_notes.copy()
+		row_height = self.chart_rect.height() / max(1, len(self.notes))
+		for row, note_name in enumerate(self.notes):
+			if note_name not in changed_notes:
+				continue
+			if previous_active_notes.get(note_name) == self.active_notes.get(note_name):
+				continue
+			y = self.chart_rect.bottom() - (row + 1) * row_height
+			self.update(0, round(y), round(self.chart_rect.left()), max(1, round(row_height) + 1))
+
 	def set_playhead_visible(self, visible: bool) -> None:
 		if self.playhead_visible == visible:
 			return
@@ -1096,7 +1145,8 @@ class DurationAnalysisDialog(QDialog):
 		self.plot_quantized_preview = False
 		self.timeline_drag: dict[str, object] | None = None
 		self.playback_timer = QTimer(self)
-		self.playback_timer.setInterval(20)
+		self.playback_timer.setTimerType(Qt.TimerType.PreciseTimer)
+		self.playback_timer.setInterval(16)
 		self.playback_timer.timeout.connect(self._playback_tick)
 		self.midi_output = None
 		self.playback_notes: list[tuple[float, int, int, int]] = []
@@ -1907,11 +1957,12 @@ class DurationAnalysisDialog(QDialog):
 				end *= unit_scale
 				if end <= start:
 					end = start + unit_scale / self.fps
+				corrected_hand_color = colors[str(corrected["hand"])]
 				corrected_bars.append({
 					"row": row,
 					"start": start,
 					"end": end,
-					"color": hand_color,
+					"color": corrected_hand_color,
 					"source": source,
 					"event_id": int(event["event_id"]),
 				})
@@ -2092,6 +2143,7 @@ class DurationAnalysisDialog(QDialog):
 		self.play_button.setText("Pause")
 		unit_scale = self.fps if self.units_combo.currentData() == "frames" else 1.0
 		self.timeline_widget.set_playhead(self.playback_start_seconds * unit_scale)
+		self._update_active_piano_keys(self.playback_start_seconds)
 		self.playback_timer.start()
 		self._update_timeline_interaction()
 
@@ -2153,11 +2205,24 @@ class DurationAnalysisDialog(QDialog):
 		current_seconds = self.playback_start_seconds + elapsed
 		self.playback_current_seconds = current_seconds
 		unit_scale = self.fps if self.units_combo.currentData() == "frames" else 1.0
+		self._update_active_piano_keys(current_seconds)
 		if self.autoscroll_checkbox.isChecked():
 			self._follow_playhead(current_seconds)
 		self.timeline_widget.set_playhead(current_seconds * unit_scale)
 		if self.playback_scheduler.completed_event.is_set():
 			self._stop_playback()
+
+	def _update_active_piano_keys(self, current_seconds: float) -> None:
+		source = str(self.playback_source_combo.currentData())
+		corrected = source.startswith("normalized") or source in ("manual", "music21")
+		active_notes: dict[str, str] = {}
+		for event in self._selected_playback_events():
+			onset, offset = self._event_bounds_seconds(
+				event, corrected=corrected, correction_source=source
+			)
+			if onset <= current_seconds < offset:
+				active_notes[str(event["note"])] = str(event["hand"])
+		self.timeline_widget.set_active_notes(active_notes)
 
 	def _follow_playhead(self, current_seconds: float) -> None:
 		measure_seconds = 4 * 60.0 / self.bpm_slider.value()
@@ -2255,6 +2320,7 @@ class DurationAnalysisDialog(QDialog):
 	def _stop_playback(self) -> None:
 		self.playback_timer.stop()
 		self._stop_playback_scheduler()
+		self.timeline_widget.set_active_notes({})
 		self._update_timeline_interaction()
 		self.play_button.setText("Play")
 
