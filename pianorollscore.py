@@ -180,8 +180,13 @@ def build_score(
 	origin_seconds: float,
 	title: str,
 	base: str = "score",
+	first_bar: int | None = None,
 ) -> ScoreSource:
-	"""notes: dicts with hand ('left'/'right'), midi_note, start, end in seconds."""
+	"""notes: dicts with hand ('left'/'right'), midi_note, start, end in seconds.
+
+	With first_bar the score is a compact excerpt whose first measure starts at
+	origin_seconds and is numbered first_bar.
+	"""
 	grid = 60.0 / bpm / 4
 	converted: dict[str, list[tuple[int, int, int]]] = {"left": [], "right": []}
 	for note in notes:
@@ -192,6 +197,8 @@ def build_score(
 		converted[hand].append((start, end, int(note["midi_note"])))
 	all_starts = [start for hand_notes in converted.values() for start, _, _ in hand_notes]
 	shift = (min(all_starts) // SLOTS_PER_MEASURE) * SLOTS_PER_MEASURE if all_starts else 0
+	if first_bar is not None:
+		shift = 0
 	for hand, hand_notes in converted.items():
 		converted[hand] = [(s - shift, e - shift, m) for s, e, m in hand_notes]
 	last_end = max((end for hand_notes in converted.values() for _, end, _ in hand_notes), default=0)
@@ -206,13 +213,25 @@ def build_score(
 		"leftHand", "bass", hand_pieces(converted["left"], total_slots)
 	)
 	safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+	if first_bar is None:
+		paper = '\\paper { #(set-paper-size "a4") indent = 0 ragged-last-bottom = ##t page-breaking = #ly:minimal-breaking }\n'
+		header = f'\\header {{ title = "{safe_title}" tagline = ##f }}\n'
+		bar_start = ""
+	else:
+		paper = (
+			'\\paper { #(set-paper-size "a4" \'landscape) indent = 0 ragged-right = ##t '
+			"ragged-last-bottom = ##t page-breaking = #ly:one-page-breaking "
+			"left-margin = 6\\mm right-margin = 6\\mm top-margin = 4\\mm bottom-margin = 4\\mm }\n"
+		)
+		header = "\\header { tagline = ##f }\n"
+		bar_start = f"      \\set Score.currentBarNumber = #{first_bar}\n"
 	main_text = (
 		'\\version "2.24.0"\n'
 		f'\\include "{right_name}"\n'
 		f'\\include "{left_name}"\n'
-		f'\\header {{ title = "{safe_title}" tagline = ##f }}\n'
-		'\\paper { #(set-paper-size "a4") indent = 0 ragged-last-bottom = ##t page-breaking = #ly:minimal-breaking }\n'
-		"\\score {\n"
+		+ header
+		+ paper
+		+ "\\score {\n"
 		"  \\new PianoStaff <<\n"
 		f'    \\new Staff = "right" {{ \\tempo 4 = {bpm} \\time 4/4 \\rightHand }}\n'
 		'    \\new Staff = "left" { \\time 4/4 \\leftHand }\n'
@@ -226,6 +245,11 @@ def build_score(
 		"  }\n"
 		"}\n"
 	)
+	if bar_start:
+		main_text = main_text.replace(
+			"  \\new PianoStaff <<\n", "  \\new PianoStaff <<\n    \\set Score.currentBarNumber = #"
+			f"{first_bar}\n", 1
+		)
 	line_slots = {(right_name, line): slot for line, slot in right_lines.items()}
 	line_slots.update({(left_name, line): slot for line, slot in left_lines.items()})
 	return ScoreSource(
@@ -241,6 +265,23 @@ def build_score(
 		pitch_columns={(right_name, *key): pitch for key, pitch in right_pitches.items()}
 		| {(left_name, *key): pitch for key, pitch in left_pitches.items()},
 	)
+
+
+def clip_notes(
+	notes: list[dict[str, object]], origin: float, grid: float, first_slot: int, last_slot: int
+) -> list[dict[str, object]]:
+	"""Notes overlapping [first_slot, last_slot), cut to that range."""
+	clipped: list[dict[str, object]] = []
+	for note in notes:
+		start = round((float(note["start"]) - origin) / grid)
+		end = max(round((float(note["end"]) - origin) / grid), start + 1)
+		if end <= first_slot or start >= last_slot:
+			continue
+		cut = note.copy()
+		cut["start"] = origin + max(start, first_slot) * grid
+		cut["end"] = origin + min(end, last_slot) * grid
+		clipped.append(cut)
+	return clipped
 
 
 def lilypond_excerpt(source: ScoreSource, hand: str, first_slot: int, last_slot: int) -> str:
@@ -259,6 +300,32 @@ def write_score_files(source: ScoreSource, directory: Path) -> Path:
 	for name, text in source.files.items():
 		(directory / name).write_text(text, encoding="utf-8")
 	return directory / source.main_name
+
+
+def measure_uncertainty(
+	notes: list[dict[str, object]], origin: float, grid: float, measures: int
+) -> list[float | None]:
+	"""Per measure doubt (0..1) from the notes' uncertainty; None where nothing is known.
+
+	Averages the three most doubtful notes, so one bad note stands out
+	without a long, mostly sound measure drowning it.
+	"""
+	per_measure: list[list[float]] = [[] for _ in range(measures)]
+	for note in notes:
+		value = note.get("uncertainty")
+		if value is None:
+			continue
+		measure = int(round((float(note["start"]) - origin) / grid)) // SLOTS_PER_MEASURE
+		if 0 <= measure < measures:
+			per_measure[measure].append(float(value))
+	result: list[float | None] = []
+	for values in per_measure:
+		if not values:
+			result.append(None)
+			continue
+		worst = sorted(values, reverse=True)[:3]
+		result.append(sum(worst) / len(worst))
+	return result
 
 
 @dataclass
@@ -393,8 +460,10 @@ def adjust_duration(
 	origin: float,
 	grid: float,
 	pitch: int | None = None,
+	whole_chord: bool = True,
 ) -> list[dict[str, object]] | None:
-	"""Change the length of one note (or, without pitch, of the chord) at a slot.
+	"""Change the length of the chord at a slot, or of one note if pitch is given
+	and whole_chord is False (then following notes are left alone).
 
 	Following notes of that hand move along unless a shortened note is
 	replaced by a rest (add_pause). Lengthening always pushes them.
@@ -405,6 +474,13 @@ def adjust_duration(
 	spans, targets = _find_targets(notes, hand, slot, origin, grid, pitch)
 	if not targets:
 		return None
+	if pitch is not None:
+		if not whole_chord:
+			result = [note.copy() for note in notes]
+			result[targets[0]]["end"] = to_seconds(spans[targets[0]][0] + new_length)
+			return result
+		chord_start = spans[targets[0]][0]
+		targets = [i for i, (start, _) in spans.items() if start == chord_start]
 	old_end = max(spans[i][1] for i in targets)
 	new_end = max(spans[i][0] + new_length for i in targets)
 	delta = new_end - old_end
@@ -416,6 +492,117 @@ def adjust_duration(
 			if i not in targets and start >= old_end:
 				result[i]["start"] = float(result[i]["start"]) + delta * grid
 				result[i]["end"] = float(result[i]["end"]) + delta * grid
+	return result
+
+
+def chord_size(
+	notes: list[dict[str, object]],
+	hand: str,
+	slot: int,
+	origin: float,
+	grid: float,
+	pitch: int | None = None,
+) -> int:
+	"""Number of notes of the hand that start together with the clicked note."""
+	spans, targets = _find_targets(notes, hand, slot, origin, grid, pitch)
+	if not targets:
+		return 0
+	chord_start = spans[targets[0]][0]
+	return sum(1 for start, _ in spans.values() if start == chord_start)
+
+
+def insert_break(
+	notes: list[dict[str, object]],
+	hand: str,
+	slot: int,
+	length: int,
+	origin: float,
+	grid: float,
+) -> list[dict[str, object]]:
+	"""Open a gap of `length` slots: later notes move, sounding notes are cut at the slot."""
+	result = [note.copy() for note in notes]
+	for note in result:
+		if ("left" if note["hand"] == "left" else "right") != hand:
+			continue
+		start = round((float(note["start"]) - origin) / grid)
+		end = max(round((float(note["end"]) - origin) / grid), start + 1)
+		if start >= slot:
+			note["start"] = float(note["start"]) + length * grid
+			note["end"] = float(note["end"]) + length * grid
+		elif end > slot:
+			note["end"] = origin + slot * grid
+	return result
+
+
+def remove_note(
+	notes: list[dict[str, object]],
+	hand: str,
+	slot: int,
+	pitch: int,
+	close_gap: bool,
+	origin: float,
+	grid: float,
+) -> tuple[list[dict[str, object]], int] | None:
+	"""Delete one note; with close_gap later notes of the hand move up by its length.
+
+	Returns (new notes, index of the removed note in the old list).
+	"""
+	spans, targets = _find_targets(notes, hand, slot, origin, grid, pitch)
+	if not targets:
+		return None
+	removed = targets[0]
+	start, end = spans[removed]
+	result = [note.copy() for note in notes]
+	if close_gap:
+		for i, (other_start, _) in spans.items():
+			if i != removed and other_start >= end:
+				result[i]["start"] = float(result[i]["start"]) - (end - start) * grid
+				result[i]["end"] = float(result[i]["end"]) - (end - start) * grid
+	del result[removed]
+	return result, removed
+
+
+def break_span(
+	notes: list[dict[str, object]],
+	hand: str,
+	slot: int,
+	origin: float,
+	grid: float,
+) -> tuple[int, int] | None:
+	"""(first, end) slots of the silent gap of a hand around a slot, if it is one."""
+	spans = []
+	for note in notes:
+		if ("left" if note["hand"] == "left" else "right") != hand:
+			continue
+		start = round((float(note["start"]) - origin) / grid)
+		spans.append((start, max(round((float(note["end"]) - origin) / grid), start + 1)))
+	if any(start <= slot < end for start, end in spans):
+		return None
+	later = [start for start, _ in spans if start >= slot]
+	if not later:
+		return None
+	return max((end for _, end in spans if end <= slot), default=0), min(later)
+
+
+def remove_break(
+	notes: list[dict[str, object]],
+	hand: str,
+	slot: int,
+	length: int,
+	origin: float,
+	grid: float,
+) -> list[dict[str, object]] | None:
+	"""Shorten the gap around a slot by `length` slots by moving later notes up."""
+	gap = break_span(notes, hand, slot, origin, grid)
+	if gap is None or not 0 < length <= gap[1] - gap[0]:
+		return None
+	result = [note.copy() for note in notes]
+	for note in result:
+		if ("left" if note["hand"] == "left" else "right") != hand:
+			continue
+		if round((float(note["start"]) - origin) / grid) >= gap[1]:
+			note["start"] = float(note["start"]) - length * grid
+			note["end"] = float(note["end"]) - length * grid
 	return result
 
 
