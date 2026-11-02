@@ -32,7 +32,9 @@ from PySide6.QtCore import (
 	QSize,
 	Qt,
 	QTimer,
+	QUrl,
 )
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtGui import (
 	QBrush,
@@ -58,6 +60,7 @@ from PySide6.QtWidgets import (
 	QHeaderView,
 	QLabel,
 	QLineEdit,
+	QListWidget,
 	QMainWindow,
 	QMenu,
 	QMessageBox,
@@ -71,6 +74,8 @@ from PySide6.QtWidgets import (
 	QStackedWidget,
 	QSplitter,
 	QTableView,
+	QTableWidget,
+	QTableWidgetItem,
 	QToolTip,
 	QVBoxLayout,
 	QWidget,
@@ -79,6 +84,10 @@ from PySide6.QtWidgets import (
 from pianorollscore import (
 	ScoreLayout,
 	ScoreSource,
+	LilypondError,
+	highlight_note,
+	parse_lilypond_hand,
+	replace_hand_range,
 	adjust_duration,
 	build_score,
 	SLOTS_PER_MEASURE,
@@ -1226,8 +1235,10 @@ class PianoRollTimeline(QOpenGLWidget):
 
 
 METRONOME_CHANNEL = 9
-METRONOME_ACCENT_NOTE = 76
+METRONOME_ACCENT_NOTE = 56  # cowbell: clearly different from the wood block beats
 METRONOME_BEAT_NOTE = 77
+METRONOME_ACCENT_VELOCITY = 127
+METRONOME_BEAT_VELOCITY = 50
 METRONOME_CLICK_SECONDS = 0.05
 
 
@@ -1281,11 +1292,15 @@ class PlaybackScheduler(threading.Thread):
 					and not self.metronome_enabled.is_set()
 				):
 					continue
+				if channel == METRONOME_CHANNEL:
+					velocity = METRONOME_ACCENT_VELOCITY if note_number == METRONOME_ACCENT_NOTE else METRONOME_BEAT_VELOCITY
+				else:
+					velocity = 85
 				self.output.send(mido.Message(
 					"note_on" if is_on else "note_off",
 					channel=channel,
 					note=note_number,
-					velocity=85 if is_on else 0,
+					velocity=velocity if is_on else 0,
 				))
 				key = (channel, note_number)
 				if is_on:
@@ -1473,9 +1488,10 @@ class ExcerptRenderer(QObject):
 		if isinstance(parent, QWidget):
 			parent.destroyed.connect(self.close)
 
-	def request(self, slot: str, notes, origin: float, first_bar: int, callback) -> None:
+	def request(self, slot: str, notes, origin: float, first_bar: int, callback, mark=None) -> None:
 		key = (
 			first_bar,
+			mark,
 			tuple(sorted(
 				(str(n["hand"]), int(n["midi_note"]),
 				 round((float(n["start"]) - origin) / self.grid),
@@ -1487,7 +1503,7 @@ class ExcerptRenderer(QObject):
 			self.requests.pop(slot, None)
 			callback(self.cache[key])
 			return
-		self.requests[slot] = (key, notes, origin, first_bar, callback)
+		self.requests[slot] = (key, notes, origin, first_bar, callback, mark)
 		if self.process is None:
 			self._next()
 
@@ -1495,10 +1511,13 @@ class ExcerptRenderer(QObject):
 		if not self.requests:
 			return
 		slot = next(iter(self.requests))
-		key, notes, origin, first_bar, callback = self.requests.pop(slot)
+		key, notes, origin, first_bar, callback, mark = self.requests.pop(slot)
 		self.job += 1
 		directory = self.work_dir / f"job{self.job}"
-		write_score_files(build_score(notes, self.bpm, origin, "p", "prev", first_bar=first_bar), directory)
+		excerpt = build_score(notes, self.bpm, origin, "p", "prev", first_bar=first_bar)
+		if mark is not None:
+			highlight_note(excerpt, *mark)
+		write_score_files(excerpt, directory)
 		self.current = (key, directory, callback)
 		self.process = QProcess(self)
 		self.process.setWorkingDirectory(str(directory))
@@ -1553,6 +1572,7 @@ class ScoreDialog(QDialog):
 		self.on_agility = on_agility
 		self.metronome_enabled = threading.Event()
 		self.edited = False
+		self.edit_base: list[dict[str, object]] | None = None
 		self.measure_risks: list[float | None] = []
 		self.uncertain_measures: list[int] = []
 		self.uncertain_cursor = -1
@@ -1684,14 +1704,18 @@ class ScoreDialog(QDialog):
 			)
 			self.agility_value_label = QLabel(f"{self.agility_slider.value()}%")
 			self.agility_applied = self.agility_slider.value()
-			self.agility_timer = QTimer(self)
-			self.agility_timer.setSingleShot(True)
-			self.agility_timer.setInterval(400)
-			self.agility_timer.timeout.connect(self._agility_changed)
 			self.agility_slider.valueChanged.connect(self._agility_moved)
 			agility_row.addWidget(self.agility_slider, 1)
 			agility_row.addWidget(self.agility_value_label)
 			controls_layout.addLayout(agility_row)
+			self.agility_stale_label = QLabel(
+				"Agility changed - the score no longer matches. Click 'Generate score' "
+				"(this discards manual edits)."
+			)
+			self.agility_stale_label.setWordWrap(True)
+			self.agility_stale_label.setStyleSheet("QLabel { color: #a05a00; font-weight: 600; }")
+			self.agility_stale_label.hide()
+			controls_layout.addWidget(self.agility_stale_label)
 		self.generate_button = QPushButton("Generate score")
 		self.generate_button.clicked.connect(self._generate_score)
 		controls_layout.addWidget(self.generate_button)
@@ -1786,6 +1810,7 @@ class ScoreDialog(QDialog):
 			self._set_status("LilyPond was not found. Install it or set LILYPOND_PATH.")
 			return
 		self._stop_playback()
+		self._apply_agility()
 		notes, origin_seconds, grid_bpm = self.note_provider(str(self.source_combo.currentData()))
 		if not notes:
 			QMessageBox.information(self, "No notes", "The selected source contains no completed notes.")
@@ -1804,28 +1829,24 @@ class ScoreDialog(QDialog):
 
 	def _agility_moved(self, value: int) -> None:
 		self.agility_value_label.setText(f"{value}%")
-		self.agility_timer.start()
+		self._update_agility_indicator()
 
-	def _agility_changed(self) -> None:
-		assert self.agility_slider is not None and self.on_agility is not None
-		value = self.agility_slider.value()
-		if value == self.agility_applied:
+	def _update_agility_indicator(self) -> None:
+		if self.agility_slider is None:
 			return
-		if self.edited and QMessageBox.question(
-			self,
-			"Discard edits?",
-			"Changing the tempo agility regenerates the score and discards your edits. Continue?",
-		) != QMessageBox.StandardButton.Yes:
-			self.agility_slider.blockSignals(True)
-			self.agility_slider.setValue(self.agility_applied)
-			self.agility_slider.blockSignals(False)
-			self.agility_value_label.setText(f"{self.agility_applied}%")
-			return
-		self.agility_applied = value
-		self.on_agility(value / 100.0)
-		if str(self.source_combo.currentData()).startswith("normalized_adaptive"):
-			self._generate_score()
+		stale = self.agility_slider.value() != self.agility_applied
+		self.agility_stale_label.setVisible(stale)
+		self.generate_button.setStyleSheet(
+			"QPushButton { background: #ffe9b8; border-color: #d89a1e; }" if stale else ""
+		)
 
+	def _apply_agility(self) -> None:
+		"""Hand the slider value to the owner so the next score uses it."""
+		if self.agility_slider is None or self.on_agility is None:
+			return
+		self.agility_applied = self.agility_slider.value()
+		self.on_agility(self.agility_applied / 100.0)
+		self._update_agility_indicator()
 	def _compile_notes(
 		self,
 		notes: list[dict[str, object]],
@@ -2111,6 +2132,7 @@ class ScoreDialog(QDialog):
 		edit_action = menu.addAction(
 			f"Edit {midi_note_name(pitch)}..." if pitch is not None else "Edit here..."
 		)
+		measure_action = menu.addAction(f"Edit bar {slot // 16 + 1}...")
 		menu.addSeparator()
 		video_action = menu.addAction("Show in video")
 		video_action.setEnabled(self.video_map is not None)
@@ -2121,6 +2143,9 @@ class ScoreDialog(QDialog):
 		chosen = menu.exec(global_pos)
 		if chosen is edit_action:
 			self._edit_notes_dialog(hand, slot, pitch)
+		elif chosen is measure_action:
+			first = slot // 16 * 16
+			self._edit_notes_dialog(hand, first, None, bar_only=True)
 		elif chosen is video_action and self.video_map is not None:
 			self.start_slot = slot
 			self._show_start_marker()
@@ -2130,7 +2155,8 @@ class ScoreDialog(QDialog):
 			self.on_jump(float(note["video_seconds"]))
 			self.accept()
 
-	def _edit_dialog(self, title: str) -> tuple[QDialog, QVBoxLayout]:
+	def _edit_dialog(self, title: str) -> tuple[QDialog, QVBoxLayout, QVBoxLayout]:
+		"""Dialog with a fixed side column (returned first) and a scrolling main column."""
 		dialog = QDialog(self)
 		dialog.setStyleSheet(
 			"QDialog { background: #eef1f4; }"
@@ -2140,10 +2166,31 @@ class ScoreDialog(QDialog):
 			"QPlainTextEdit { background: #ffffff; color: #18212b; border: 1px solid #aebbc5; "
 			"font-family: Consolas, monospace; }"
 			"QPushButton { background: #ffffff; color: #18212b; border: 1px solid #aebbc5; padding: 6px 12px; }"
+			"QScrollArea { border: none; background: #eef1f4; }"
+			"QWidget#editContent { background: #eef1f4; }"
 		)
 		dialog.setWindowTitle(title)
-		dialog.resize(760, 860)
-		return dialog, QVBoxLayout(dialog)
+		available = self.screen().availableGeometry()
+		dialog.resize(
+			min(1280, int(available.width() * 0.92)), min(900, int(available.height() * 0.88))
+		)
+		outer = QVBoxLayout(dialog)
+		body = QHBoxLayout()
+		outer.addLayout(body, 1)
+		side_widget = QWidget()
+		side_widget.setFixedWidth(330)
+		side = QVBoxLayout(side_widget)
+		side.setContentsMargins(0, 0, 0, 0)
+		body.addWidget(side_widget)
+		scroll = QScrollArea()
+		scroll.setWidgetResizable(True)
+		content = QWidget()
+		content.setObjectName("editContent")
+		main = QVBoxLayout(content)
+		scroll.setWidget(content)
+		body.addWidget(scroll, 1)
+		dialog.outer_layout = outer  # type: ignore[attr-defined]
+		return dialog, side, main
 
 	def _edit_preview(self, form: QVBoxLayout):
 		"""Add change list, live rendering and LilyPond views; returns refresh(new_notes, hand)."""
@@ -2155,8 +2202,11 @@ class ScoreDialog(QDialog):
 		changes.setMaximumHeight(110)
 		form.addWidget(changes)
 		images = []
-		for title in ("Before", "After"):
-			form.addWidget(QLabel(title))
+		titles = []
+		for title in ("Current (highlighted: selected note)", "With the pending change"):
+			title_label = QLabel(title)
+			form.addWidget(title_label)
+			titles.append(title_label)
 			image_label = QLabel("")
 			image_label.setMinimumHeight(130)
 			image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -2165,9 +2215,11 @@ class ScoreDialog(QDialog):
 			images.append(image_label)
 		columns = QHBoxLayout()
 		views = []
-		for title in ("LilyPond before", "LilyPond after"):
+		for title in ("LilyPond current", "LilyPond with pending change"):
 			column = QVBoxLayout()
-			column.addWidget(QLabel(title))
+			title_label = QLabel(title)
+			column.addWidget(title_label)
+			titles.append(title_label)
 			view = QPlainTextEdit()
 			view.setReadOnly(True)
 			view.setMaximumHeight(110)
@@ -2176,16 +2228,16 @@ class ScoreDialog(QDialog):
 			columns.addLayout(column)
 			views.append(view)
 		form.addLayout(columns)
+		pending_widgets = [titles[1], images[1], titles[3], views[1]]
 		source = self.score_source
 		assert source is not None
 		origin, grid = source.time_origin, source.grid_seconds
-		old_notes = self.score_notes
 		try:
 			bpm = int(self.bpm_entry.text())
 		except ValueError:
 			bpm = round(15.0 / grid)
 		renderer = ExcerptRenderer(str(self.lilypond_path), bpm, grid, self)
-		form.parentWidget().finished.connect(lambda _r: renderer.close())
+		form.parentWidget().window().finished.connect(lambda _r: renderer.close())
 
 		def show_image(label: QLabel, image: QImage | None) -> None:
 			if image is None or image.isNull():
@@ -2205,23 +2257,85 @@ class ScoreDialog(QDialog):
 			start = round((float(note["start"]) - origin) / grid)
 			return start, max(round((float(note["end"]) - origin) / grid), start + 1)
 
+		def render(name: str, label: QLabel, notes, first: int, last: int, mark) -> None:
+			label.setPixmap(QPixmap())
+			label.setText("Rendering...")
+			renderer.request(
+				name,
+				clip_notes(notes, origin, grid, first, last),
+				origin + first * grid,
+				first // 16 + 1,
+				lambda image, label=label: show_image(label, image),
+				None if mark is None else (mark[0], mark[1] - first, mark[2]),
+			)
+
+		def set_pending_visible(visible: bool) -> None:
+			for widget in pending_widgets:
+				widget.setVisible(visible)
+			if not visible:
+				renderer.requests.pop("pending", None)
+				for view in (views[1],):
+					view.setPlainText("")
+				images[1].setPixmap(QPixmap())
+				images[1].setText("")
+
+		def show_current(first: int, last: int) -> None:
+			"""Render the working state around the selected note, highlighting it."""
+			target = getattr(refresh, "target", None)
+			if target is None:
+				return
+			base = self._base_notes()
+			score = source if self.edit_base is None else build_score(base, bpm, origin, "preview")
+			views[0].setPlainText(
+				f"% {target[0]} hand, bars {first // 16 + 1}-{last // 16}\n"
+				+ lilypond_excerpt(score, target[0], first, last)
+			)
+			render("current", images[0], base, first, last, target)
+
+		def current_range() -> tuple[int, int]:
+			target = getattr(refresh, "target", None)
+			bar = target[1] // 16 if target is not None else 0
+			first = max(0, bar - 1) * 16
+			return first, first + 3 * 16
+
 		def clear() -> None:
-			for view in views:
-				view.setPlainText("")
-			for label in images:
-				label.setPixmap(QPixmap())
-				label.setText("")
+			set_pending_visible(False)
 
 		def refresh(
-			new_notes: list[dict[str, object]] | None, hand: str, removed: int | None = None
+			new_notes: list[dict[str, object]] | None,
+			hand: str,
+			removed: int | None = None,
+			generic: bool = False,
 		) -> None:
+			old_notes = self._base_notes()
+			refresh.last_lines = []
 			if new_notes is None:
 				changes.setPlainText("Nothing changes.")
 				clear()
+				show_current(*current_range())
 				return
 			lines: list[str] = []
 			touched: list[int] = []
-			if removed is not None:
+			if generic:
+				def keyed(notes: list[dict[str, object]]) -> dict[tuple[str, int, int, int], int]:
+					counts: dict[tuple[str, int, int, int], int] = {}
+					for note in notes:
+						start, end = span(note)
+						key = (str(note["hand"]), int(note["midi_note"]), start, end)
+						counts[key] = counts.get(key, 0) + 1
+					return counts
+
+				old_keys, new_keys = keyed(old_notes), keyed(new_notes)
+				for label, mine, other in (("removed", old_keys, new_keys), ("added", new_keys, old_keys)):
+					for key in sorted(mine, key=lambda item: (item[2], item[1])):
+						if mine[key] > other.get(key, 0):
+							note_hand, midi, start, end = key
+							lines.append(
+								f"{label} {midi_note_name(midi)} ({note_hand}): "
+								f"{where(start)}, {end - start}/16"
+							)
+							touched += [start, end]
+			elif removed is not None:
 				gone = old_notes[removed]
 				gone_start, gone_end = span(gone)
 				lines.append(
@@ -2229,7 +2343,7 @@ class ScoreDialog(QDialog):
 					f"{where(gone_start)}, {gone_end - gone_start}/16"
 				)
 				touched += [gone_start, gone_end]
-			for index, new in enumerate(new_notes):
+			for index, new in enumerate([] if generic else new_notes):
 				name = f"{midi_note_name(int(new['midi_note']))} ({new['hand']})"
 				new_start, new_end = span(new)
 				old_index = index + (1 if removed is not None and index >= removed else 0)
@@ -2248,36 +2362,90 @@ class ScoreDialog(QDialog):
 						f"{old_end - old_start}/16 -> {new_end - new_start}/16"
 					)
 				touched += [old_start, new_start, old_end, new_end]
+			refresh.last_lines = list(lines)
 			if len(lines) > MAX_LISTED:
 				lines = lines[:MAX_LISTED] + [f"... and {len(lines) - MAX_LISTED} more changes"]
 			changes.setPlainText("\n".join(lines) or "Nothing changes.")
 			if not touched:
 				clear()
+				show_current(*current_range())
 				return
 			first = min(touched) // 16 * 16
 			last = min(first + PREVIEW_BARS * 16, (max(touched) // 16 + 1) * 16)
+			set_pending_visible(True)
+			show_current(first, last)
 			preview = build_score(new_notes, bpm, origin, "preview")
-			for view, score in zip(views, (source, preview)):
-				excerpt = lilypond_excerpt(score, hand, first, last)
-				view.setPlainText(f"% {hand} hand, bars {first // 16 + 1}-{last // 16}\n{excerpt}")
-			for label, notes, name in ((images[0], old_notes, "before"), (images[1], new_notes, "after")):
-				label.setPixmap(QPixmap())
-				label.setText("Rendering...")
-				renderer.request(
-					name,
-					clip_notes(notes, origin, grid, first, last),
-					origin + first * grid,
-					first // 16 + 1,
-					lambda image, label=label: show_image(label, image),
-				)
+			views[1].setPlainText(
+				f"% {hand} hand, bars {first // 16 + 1}-{last // 16}\n"
+				+ lilypond_excerpt(preview, hand, first, last)
+			)
+			render("pending", images[1], new_notes, first, last, None)
 
+		refresh.last_lines = []
+		refresh.target = None
 		return refresh
+
+	def _base_notes(self) -> list[dict[str, object]]:
+		"""Notes the edit dialog currently works on (score notes plus queued edits)."""
+		return self.edit_base if self.edit_base is not None else self.score_notes
 
 	def _page(self) -> tuple[QWidget, QVBoxLayout]:
 		page = QWidget()
 		form = QVBoxLayout(page)
 		form.setContentsMargins(0, 0, 0, 0)
 		return page, form
+
+	def _lilypond_page(self, hand: str, measure: int, refresh, state):
+		assert self.score_source is not None
+		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
+		page, form = self._page()
+		first, last = measure * 16, measure * 16 + 16
+		try:
+			bpm = int(self.bpm_entry.text())
+		except ValueError:
+			bpm = round(15.0 / grid)
+		base = self._base_notes()
+		excerpt = lilypond_excerpt(build_score(base, bpm, origin, "edit", first_bar=1), hand, first, last)
+		form.addWidget(QLabel(
+			f"LilyPond of the {hand} hand, bar {measure + 1} (c' = middle C, durations in 16ths). "
+			"Notes tied across the bar lines stay attached."
+		))
+		editor = QPlainTextEdit(excerpt)
+		editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+		editor.setMinimumHeight(170)
+		form.addWidget(editor)
+		status = QLabel("")
+		status.setWordWrap(True)
+		form.addWidget(status)
+		timer = QTimer(page)
+		timer.setSingleShot(True)
+		timer.setInterval(500)
+
+		def update() -> None:
+			timer.stop()
+			state["edited"] = None
+			try:
+				parsed, dangling, total = parse_lilypond_hand(editor.toPlainText())
+			except LilypondError as error:
+				status.setStyleSheet("color: #b3261e;")
+				status.setText(str(error))
+				refresh(None, hand)
+				return
+			status.setStyleSheet("color: #53616d;")
+			status.setText(
+				"" if total == 16
+				else f"Bar length is {total}/16: following notes of this hand move accordingly."
+			)
+			edited = replace_hand_range(
+				base, hand, first, last, parsed, dangling, total, origin, grid
+			)
+			refresh(edited, hand, generic=True)
+			if getattr(refresh, "last_lines", None):
+				state["edited"] = edited
+
+		timer.timeout.connect(update)
+		editor.textChanged.connect(timer.start)
+		return page, update
 
 	def _adjust_duration_page(self, hand: str, slot: int, length: int, pitch: int | None, refresh, state):
 		assert self.score_source is not None
@@ -2300,7 +2468,7 @@ class ScoreDialog(QDialog):
 		pause = QCheckBox("Add pause (following notes stay in place)")
 		form.addWidget(pause)
 		chord_count = (
-			chord_size(self.score_notes, hand, slot, origin, grid, pitch) if pitch is not None else 0
+			chord_size(self._base_notes(), hand, slot, origin, grid, pitch) if pitch is not None else 0
 		)
 		whole = QCheckBox("Edit whole chord (all notes starting here)")
 		whole.setEnabled(chord_count > 1)
@@ -2325,7 +2493,7 @@ class ScoreDialog(QDialog):
 			edited = None
 			if new_length != length:
 				edited = adjust_duration(
-					self.score_notes, hand, slot, new_length, pause.isChecked(), origin, grid,
+					self._base_notes(), hand, slot, new_length, pause.isChecked(), origin, grid,
 					pitch, not single,
 				)
 			state["edited"] = edited
@@ -2373,7 +2541,7 @@ class ScoreDialog(QDialog):
 				self.video_map(origin + start * grid) if self.video_map is not None else None
 			)
 			edited = insert_note(
-				self.score_notes, hand, int(pitch_combo.currentData()), start,
+				self._base_notes(), hand, int(pitch_combo.currentData()), start,
 				int(length_combo.currentData()), push.isChecked(), origin, grid, video_seconds,
 			)
 			state["edited"] = edited
@@ -2412,7 +2580,7 @@ class ScoreDialog(QDialog):
 			start = position.value()
 			position_label.setText(f"bar {start // 16 + 1}, beat {start % 16 / 4 + 1:g}")
 			edited = insert_break(
-				self.score_notes, hand, start, int(length_combo.currentData()), origin, grid
+				self._base_notes(), hand, start, int(length_combo.currentData()), origin, grid
 			)
 			state["edited"] = edited
 			refresh(edited, hand)
@@ -2424,7 +2592,7 @@ class ScoreDialog(QDialog):
 	def _remove_note_page(self, hand: str, slot: int, pitch: int, refresh, state):
 		assert self.score_source is not None
 		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
-		note = find_note(self.score_notes, hand, slot, origin, grid, pitch)
+		note = find_note(self._base_notes(), hand, slot, origin, grid, pitch)
 		if note is None:
 			return None
 		page, form = self._page()
@@ -2440,7 +2608,7 @@ class ScoreDialog(QDialog):
 			and round((float(other["start"]) - origin) / grid) < end
 			and max(round((float(other["end"]) - origin) / grid),
 				round((float(other["start"]) - origin) / grid) + 1) > start
-			for other in self.score_notes
+			for other in self._base_notes()
 		)
 		close = QCheckBox("Close gap (following notes move up)")
 		close.setEnabled(alone)
@@ -2448,7 +2616,7 @@ class ScoreDialog(QDialog):
 
 		def update() -> None:
 			result = remove_note(
-				self.score_notes, hand, slot, pitch, close.isChecked() and alone, origin, grid
+				self._base_notes(), hand, slot, pitch, close.isChecked() and alone, origin, grid
 			)
 			if result is None:
 				state["edited"] = None
@@ -2463,7 +2631,7 @@ class ScoreDialog(QDialog):
 	def _remove_break_page(self, hand: str, slot: int, refresh, state):
 		assert self.score_source is not None
 		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
-		gap = break_span(self.score_notes, hand, slot, origin, grid)
+		gap = break_span(self._base_notes(), hand, slot, origin, grid)
 		if gap is None:
 			return None
 		page, form = self._page()
@@ -2479,25 +2647,90 @@ class ScoreDialog(QDialog):
 		form.addWidget(amount)
 
 		def update() -> None:
-			edited = remove_break(self.score_notes, hand, slot, amount.value(), origin, grid)
+			edited = remove_break(self._base_notes(), hand, slot, amount.value(), origin, grid)
 			state["edited"] = edited
 			refresh(edited, hand)
 
 		amount.valueChanged.connect(update)
 		return page, update
 
-	def _edit_notes_dialog(self, hand: str, slot: int, pitch: int | None) -> None:
+	def _measure_rows(self, measure: int) -> list[tuple[str, int, int | None, int]]:
+		"""(hand, start slot, pitch or None for a break, length) of everything in a bar."""
 		assert self.score_source is not None
 		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
-		dialog, form = self._edit_dialog("Edit score")
+		base = self._base_notes()
+		first = measure * 16
+		last = first + 16
+		rows: list[tuple[str, int, int | None, int]] = []
+		for hand in ("right", "left"):
+			entries = []
+			for note in base:
+				if ("left" if note["hand"] == "left" else "right") != hand:
+					continue
+				start = round((float(note["start"]) - origin) / grid)
+				if first <= start < last:
+					end = max(round((float(note["end"]) - origin) / grid), start + 1)
+					entries.append((start, -int(note["midi_note"]), end - start))
+			rows += [(hand, start, -negated, length) for start, negated, length in sorted(entries)]
+			gaps = set()
+			for slot in range(first, last):
+				gap = break_span(base, hand, slot, origin, grid)
+				if gap is not None and gap not in gaps:
+					gaps.add(gap)
+					rows.append((hand, max(gap[0], first), None, gap[1] - gap[0]))
+		rows.sort(key=lambda row: (row[0] != "right", row[1], row[2] is not None, -(row[2] or 0)))
+		return rows
+
+	def _edit_notes_dialog(
+		self, hand: str, slot: int, pitch: int | None, bar_only: bool = False
+	) -> None:
+		"""Edit a bar: pick a note or break, stack any number of edits, apply them together."""
+		assert self.score_source is not None
+		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
+		measure = slot // 16
+		dialog, side, form = self._edit_dialog(f"Edit bar {measure + 1}")
+		self.edit_base = None
+		target = {"hand": hand, "slot": slot, "pitch": pitch}
+		history: list[list[dict[str, object]] | None] = []
+
+		side.addWidget(QLabel(f"Bar {measure + 1}: select a note or break."))
+		table = QTableWidget(0, 4)
+		table.setHorizontalHeaderLabels(["Hand", "Beat", "Note", "Length"])
+		table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+		table.verticalHeader().setVisible(False)
+		table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+		table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+		table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+		table.setStyleSheet(
+			"QTableWidget { background: #ffffff; color: #18212b; }"
+			"QTableWidget::item:selected { background: #cfe3f1; color: #18212b; }"
+			"QHeaderView::section { background: #e3e8ed; color: #18212b; padding: 3px; }"
+		)
+		side.addWidget(table, 3)
 		form.addWidget(QLabel("Action"))
 		action_combo = QComboBox()
 		form.addWidget(action_combo)
 		stack = QStackedWidget()
 		form.addWidget(stack)
+
+		queue_row = QHBoxLayout()
+		add_button = QPushButton("Add edit to list")
+		undo_button = QPushButton("Undo last edit")
+		undo_button.setEnabled(False)
+		for button in (add_button, undo_button):
+			button.setAutoDefault(False)
+		queue_row.addWidget(add_button)
+		queue_row.addWidget(undo_button)
+		side.addLayout(queue_row)
+		side.addWidget(QLabel("Edits in this session (applied with OK)"))
+		queue_list = QListWidget()
+		queue_list.setStyleSheet("QListWidget { background: #ffffff; color: #18212b; }")
+		side.addWidget(queue_list, 2)
+
 		refresh = self._edit_preview(form)
 		state: dict[str, object] = {"edited": None}
-		updates = []
+		updates: list = []
+		rows: list[tuple[str, int, int | None, int]] = []
 
 		def add(label: str, built) -> None:
 			if built is None:
@@ -2507,37 +2740,128 @@ class ScoreDialog(QDialog):
 			stack.addWidget(page)
 			updates.append(update)
 
-		length = (
-			current_length(self.score_notes, hand, slot, origin, grid, pitch)
-			if pitch is not None else None
-		)
-		if length is not None:
-			add("Adjust duration", self._adjust_duration_page(hand, slot, length, pitch, refresh, state))
-		add("Insert note", self._insert_note_page(hand, slot, pitch, refresh, state))
-		add("Insert break", self._insert_break_page(hand, slot, refresh, state))
-		if pitch is not None:
-			add("Remove note", self._remove_note_page(hand, slot, pitch, refresh, state))
-		else:
-			add("Remove break", self._remove_break_page(hand, slot, refresh, state))
-
 		def choose(index: int) -> None:
-			stack.setCurrentIndex(index)
-			updates[index]()
+			if 0 <= index < len(updates):
+				stack.setCurrentIndex(index)
+				updates[index]()
+
+		def rebuild(fresh: bool) -> None:
+			"""Recreate the action pages for the selected target on the current notes."""
+			t_hand, t_slot, t_pitch = target["hand"], target["slot"], target["pitch"]
+			refresh.target = (str(t_hand), int(t_slot), t_pitch)
+			action_combo.blockSignals(True)
+			action_combo.clear()
+			while stack.count():
+				widget = stack.widget(0)
+				stack.removeWidget(widget)
+				widget.deleteLater()
+			updates.clear()
+			base = self._base_notes()
+			length = (
+				current_length(base, t_hand, t_slot, origin, grid, t_pitch)
+				if t_pitch is not None else None
+			)
+			if length is not None:
+				add("Adjust duration", self._adjust_duration_page(t_hand, t_slot, length, t_pitch, refresh, state))
+			add("Insert note", self._insert_note_page(t_hand, t_slot, t_pitch, refresh, state))
+			add("Insert break", self._insert_break_page(t_hand, t_slot, refresh, state))
+			if t_pitch is not None:
+				add("Remove note", self._remove_note_page(t_hand, t_slot, t_pitch, refresh, state))
+			else:
+				add("Remove break", self._remove_break_page(t_hand, t_slot, refresh, state))
+			add("Edit LilyPond", self._lilypond_page(str(t_hand), int(t_slot) // 16, refresh, state))
+			action_combo.blockSignals(False)
+			if fresh:
+				# nothing is pending until the user touches a control
+				stack.setCurrentIndex(0)
+				state["edited"] = None
+				refresh(None, str(t_hand))
+			else:
+				choose(0)
+
+		def fill_table() -> None:
+			rows[:] = self._measure_rows(measure)
+			table.blockSignals(True)
+			table.setRowCount(len(rows))
+			selected = -1
+			for index, (row_hand, start, row_pitch, length) in enumerate(rows):
+				values = (
+					row_hand,
+					f"{start % 16 / 4 + 1:g}",
+					midi_note_name(row_pitch) if row_pitch is not None else "break",
+					f"{length}/16",
+				)
+				for column, value in enumerate(values):
+					table.setItem(index, column, QTableWidgetItem(value))
+				same_target = (
+					start <= int(target["slot"]) < start + length
+					if row_pitch is None else start == target["slot"]
+				)
+				if (row_hand, row_pitch) == (target["hand"], target["pitch"]) and same_target and selected < 0:
+					selected = index
+			if selected >= 0:
+				table.selectRow(selected)
+			else:
+				table.clearSelection()
+			table.blockSignals(False)
+
+		def row_selected() -> None:
+			indexes = table.selectionModel().selectedRows()
+			if not indexes:
+				return
+			row_hand, start, row_pitch, _length = rows[indexes[0].row()]
+			target.update({"hand": row_hand, "slot": start, "pitch": row_pitch})
+			rebuild(True)
+
+		def commit() -> None:
+			edited = state["edited"]
+			if edited is None:
+				return
+			lines = list(getattr(refresh, "last_lines", []))
+			summary = (lines[0] if lines else "edit") + (f" (+{len(lines) - 1} more)" if len(lines) > 1 else "")
+			history.append(self.edit_base)
+			self.edit_base = edited
+			queue_list.addItem(summary)
+			undo_button.setEnabled(True)
+			fill_table()
+			rebuild(True)
+
+		def undo() -> None:
+			if not history:
+				return
+			self.edit_base = history.pop()
+			queue_list.takeItem(queue_list.count() - 1)
+			undo_button.setEnabled(bool(history))
+			fill_table()
+			rebuild(True)
 
 		action_combo.currentIndexChanged.connect(choose)
-		choose(0)
-		self._run_edit_dialog(dialog, form, state)
+		table.itemSelectionChanged.connect(row_selected)
+		add_button.clicked.connect(commit)
+		undo_button.clicked.connect(undo)
+		fill_table()
+		if bar_only and rows:
+			target.update({"hand": rows[0][0], "slot": rows[0][1], "pitch": rows[0][2]})
+			fill_table()
+		rebuild(False)
+		try:
+			self._run_edit_dialog(dialog, state)
+		finally:
+			self.edit_base = None
 
-	def _run_edit_dialog(self, dialog: QDialog, form: QVBoxLayout, state: dict[str, object]) -> None:
+	def _run_edit_dialog(self, dialog: QDialog, state: dict[str, object]) -> None:
 		buttons = QDialogButtonBox(
 			QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
 		)
 		buttons.accepted.connect(dialog.accept)
 		buttons.rejected.connect(dialog.reject)
-		form.addWidget(buttons)
-		if dialog.exec() != QDialog.DialogCode.Accepted or state["edited"] is None:
+		dialog.outer_layout.addWidget(buttons)  # type: ignore[attr-defined]
+		if dialog.exec() != QDialog.DialogCode.Accepted:
 			return
-		self._apply_edit(state["edited"])
+		# a pending edit already contains the queued ones, since it builds on them
+		final = state["edited"] if state["edited"] is not None else self.edit_base
+		if final is not None:
+			self._apply_edit(final)
 
 	def _apply_edit(self, edited: list[dict[str, object]]) -> None:
 		assert self.score_source is not None
@@ -3018,14 +3342,20 @@ class DurationAnalysisDialog(QDialog):
 			"performance. Low: hold the tempo (steady grid). High: follow quickly."
 		)
 		self.agility_value_label = QLabel(f"{self.agility_slider.value()}%")
-		self.agility_timer = QTimer(self)
-		self.agility_timer.setSingleShot(True)
-		self.agility_timer.setInterval(250)
-		self.agility_timer.timeout.connect(self._apply_agility_slider)
 		self.agility_slider.valueChanged.connect(self._agility_slider_moved)
 		agility_row.addWidget(self.agility_slider, 1)
 		agility_row.addWidget(self.agility_value_label)
 		settings.addLayout(agility_row)
+		self.agility_apply_button = QPushButton("Apply agility")
+		self.agility_apply_button.clicked.connect(self._apply_agility_slider)
+		settings.addWidget(self.agility_apply_button)
+		self.agility_stale_label = QLabel(
+			"Agility changed - the tempo-adaptive data no longer matches. Click 'Apply agility'."
+		)
+		self.agility_stale_label.setWordWrap(True)
+		self.agility_stale_label.setStyleSheet("color: #a05a00; font-weight: 600;")
+		self.agility_stale_label.hide()
+		settings.addWidget(self.agility_stale_label)
 		if self.estimated_bpm is None:
 			estimate_label = f"Song reference: {SONG_REFERENCE_BPM} BPM"
 		elif self.alternative_bpm is not None:
@@ -3494,19 +3824,26 @@ class DurationAnalysisDialog(QDialog):
 
 	def _agility_slider_moved(self, value: int) -> None:
 		self.agility_value_label.setText(f"{value}%")
-		self.agility_timer.start()
+		self._update_agility_indicator()
+
+	def _update_agility_indicator(self) -> None:
+		stale = self.agility_slider.value() != round(self.tempo_agility * 100)
+		self.agility_stale_label.setVisible(stale)
+		self.agility_apply_button.setStyleSheet(
+			"QPushButton { background: #ffe9b8; border-color: #d89a1e; }" if stale else ""
+		)
 
 	def _apply_agility_slider(self) -> None:
 		self.set_tempo_agility(self.agility_slider.value() / 100.0)
 
 	def set_tempo_agility(self, agility: float) -> None:
 		"""Recompute the tempo-adaptive variants and refresh the display."""
-		self.agility_timer.stop()
 		self.tempo_agility = agility
 		self.agility_slider.blockSignals(True)
 		self.agility_slider.setValue(round(agility * 100))
 		self.agility_slider.blockSignals(False)
 		self.agility_value_label.setText(f"{self.agility_slider.value()}%")
+		self._update_agility_indicator()
 		self._compute_adaptive_normalizations()
 		self._update_plot()
 
@@ -4503,6 +4840,10 @@ class PianoRollReaderWindow(QMainWindow):
 		self.midi_ticks_per_beat = 480
 		self.timer = QTimer(self)
 		self.timer.timeout.connect(self._process_next_frame)
+		self.audio_output = QAudioOutput(self)
+		self.audio_player = QMediaPlayer(self)
+		self.audio_player.setAudioOutput(self.audio_output)
+		self.audio_wanted = False
 		self.table_flush_timer = QTimer(self)
 		self.table_flush_timer.setSingleShot(True)
 		self.table_flush_timer.timeout.connect(self._flush_table_updates)
@@ -4534,6 +4875,13 @@ class PianoRollReaderWindow(QMainWindow):
 		self.restart_button.setEnabled(False)
 		self.restart_button.clicked.connect(self.restart)
 		toolbar.addWidget(self.restart_button)
+		self.audio_checkbox = QCheckBox("Play audio")
+		self.audio_checkbox.setToolTip(
+			"Play the video's sound while processing. Processing slower than real time "
+			"makes the sound jump forward to stay in sync."
+		)
+		self.audio_checkbox.toggled.connect(self._audio_toggled)
+		toolbar.addWidget(self.audio_checkbox)
 		self.save_button = QPushButton("Export MIDI")
 		self.save_button.setEnabled(False)
 		self.save_button.clicked.connect(self.save_midi_as)
@@ -4767,9 +5115,35 @@ class PianoRollReaderWindow(QMainWindow):
 		elif self.capture is not None:
 			self.timer.start(max(1, round(1000 / self.fps)))
 			self.play_button.setText("Pause")
+			self._audio_start()
+
+	def _audio_position_ms(self) -> int:
+		return max(0, round(self.frame_index / self.fps * 1000))
+
+	def _audio_start(self) -> None:
+		if not self.audio_wanted or self.video_path is None:
+			return
+		if self.audio_player.source().toLocalFile() != str(self.video_path):
+			self.audio_player.setSource(QUrl.fromLocalFile(str(self.video_path)))
+		self.audio_player.setPosition(self._audio_position_ms())
+		self.audio_player.play()
+
+	def _audio_toggled(self, on: bool) -> None:
+		self.audio_wanted = on
+		if not on:
+			self.audio_player.pause()
+		elif self.timer.isActive():
+			self._audio_start()
+
+	def _audio_resync(self) -> None:
+		"""Jump the sound forward when frame processing falls behind real time."""
+		if self.audio_wanted and self.timer.isActive():
+			if abs(self.audio_player.position() - self._audio_position_ms()) > 500:
+				self.audio_player.setPosition(self._audio_position_ms())
 
 	def pause(self) -> None:
 		self.timer.stop()
+		self.audio_player.pause()
 		if hasattr(self, "play_button"):
 			self.play_button.setText("Play")
 
@@ -4808,6 +5182,8 @@ class PianoRollReaderWindow(QMainWindow):
 			return
 
 		self.frame_index += 1
+		if self.frame_index % round(self.fps) == 0:
+			self._audio_resync()
 		pressed = self._score_frame(frame)
 		self._update_waterfall_events(frame, self.frame_index)
 		changed = self._update_events(pressed, self.frame_index)

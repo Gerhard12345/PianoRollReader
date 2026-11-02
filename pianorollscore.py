@@ -295,6 +295,41 @@ def lilypond_excerpt(source: ScoreSource, hand: str, first_slot: int, last_slot:
 	return "\n".join(lines[line - 1].strip() for line in chosen)
 
 
+def highlight_note(source: ScoreSource, hand: str, slot: int, pitch: int | None) -> None:
+	"""Colour the note head (or rest) at a slot red in the generated LilyPond text."""
+	name = f"{source.main_name.removesuffix('.ly')}_{hand}.ly"
+	lines = source.files[name].splitlines()
+	candidates = sorted(
+		(line, start) for (file, line), start in source.line_slots.items() if file == name
+	)
+	column = 2
+	chosen: list[int] = []
+	if pitch is not None:
+		for line, start in candidates:
+			if start == slot:
+				for (file, row, col), value in source.pitch_columns.items():
+					if file == name and row == line and value == pitch:
+						chosen, column = [line], col
+				if chosen:
+					break
+	else:
+		# a break may be engraved as several consecutive rests
+		lines_in_order = [line for line, _start in candidates]
+		holder = max((i for i, (_l, start) in enumerate(candidates) if start <= slot), default=None)
+		if holder is not None and lines[lines_in_order[holder] - 1].lstrip().startswith("r"):
+			low = high = holder
+			while low > 0 and lines[lines_in_order[low - 1] - 1].lstrip().startswith("r"):
+				low -= 1
+			while high + 1 < len(lines_in_order) and lines[lines_in_order[high + 1] - 1].lstrip().startswith("r"):
+				high += 1
+			chosen = lines_in_order[low:high + 1]
+	for line in chosen:
+		text = lines[line - 1]
+		lines[line - 1] = text[:column] + "\\tweak color #red " + text[column:]
+	if chosen:
+		source.files[name] = "\n".join(lines) + "\n"
+
+
 def write_score_files(source: ScoreSource, directory: Path) -> Path:
 	directory.mkdir(parents=True, exist_ok=True)
 	for name, text in source.files.items():
@@ -603,6 +638,162 @@ def remove_break(
 		if round((float(note["start"]) - origin) / grid) >= gap[1]:
 			note["start"] = float(note["start"]) - length * grid
 			note["end"] = float(note["end"]) - length * grid
+	return result
+
+
+LETTER_SEMITONES = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
+PITCH_TOKEN = re.compile(r"^([a-g])((?:is|es|s)*)([',]*)(~?)$")
+LENGTH_TOKEN = re.compile(r"^(\d+)(\.*)$")
+
+
+class LilypondError(ValueError):
+	pass
+
+
+def _parse_pitch(token: str) -> tuple[int, bool]:
+	match = PITCH_TOKEN.match(token)
+	if not match:
+		raise LilypondError(f"Cannot read pitch '{token}'.")
+	letter, accidentals, marks, tie = match.groups()
+	shift = 0
+	while accidentals:
+		if accidentals.startswith("is"):
+			shift, accidentals = shift + 1, accidentals[2:]
+		elif accidentals.startswith("es"):
+			shift, accidentals = shift - 1, accidentals[2:]
+		else:
+			shift, accidentals = shift - 1, accidentals[1:]
+	octave = marks.count("'") - marks.count(",")
+	return 48 + LETTER_SEMITONES[letter] + shift + 12 * octave, bool(tie)
+
+
+def _parse_length(token: str) -> int:
+	match = LENGTH_TOKEN.match(token)
+	if not match:
+		raise LilypondError(f"Cannot read duration '{token}'.")
+	value, dots = int(match.group(1)), len(match.group(2))
+	if value not in (1, 2, 4, 8, 16):
+		raise LilypondError(f"Duration {value} is too short; the grid is 16th notes.")
+	length = SLOTS_PER_MEASURE // value
+	total, part = length, length
+	for _ in range(dots):
+		part /= 2
+		total += part
+	if total != int(total):
+		raise LilypondError(f"Duration '{token}' does not fit the 16th grid.")
+	return int(total)
+
+
+def parse_lilypond_hand(text: str) -> tuple[list[tuple[int, int, int]], set[int], int]:
+	"""Read the notes/chords/rests written by build_score (plus ties and repeated durations).
+
+	Returns ([(start, end, midi)], pitches still tied at the end, total length in slots).
+	"""
+	body = re.sub(r"%[^\n]*", " ", text)
+	body = re.sub(r'\\bar\s*"[^"]*"', " ", body)
+	body = re.sub(r"\\clef\s+\w+", " ", body)
+	body = body.replace("|", " ")
+	events = re.findall(r"<[^>]*>[^\s<]*|[^\s<]+", body)
+	notes: list[list[int]] = []
+	open_ties: dict[int, int] = {}
+	position = 0
+	last_length = "4"
+	for event in events:
+		if event.startswith("<"):
+			close = event.index(">")
+			pitch_tokens = event[1:close].split()
+			rest = event[close + 1:]
+			if not pitch_tokens:
+				raise LilypondError("Empty chord.")
+		else:
+			match = re.match(r"^([a-gRrs][a-z,']*?(?:~?))((?:\d+\.*)?)(~?)$", event)
+			if not match:
+				raise LilypondError(f"Cannot read '{event}'.")
+			head, duration, tie = match.groups()
+			head_core = head.rstrip("~")
+			if head_core in ("r", "R", "s"):
+				pitch_tokens = []
+			else:
+				pitch_tokens = [head_core + ("~" if tie or head.endswith("~") else "")]
+			rest = duration
+		length_token = rest.rstrip("~") or last_length
+		trailing_tie = rest.endswith("~") and rest != ""
+		last_length = length_token
+		length = _parse_length(length_token)
+		next_open: dict[int, int] = {}
+		for token in pitch_tokens:
+			pitch, tied = _parse_pitch(token)
+			tied = tied or trailing_tie
+			if pitch in open_ties:
+				index = open_ties[pitch]
+				notes[index][1] = position + length
+			else:
+				notes.append([position, position + length, pitch])
+				index = len(notes) - 1
+			if tied:
+				next_open[pitch] = index
+		open_ties = next_open
+		position += length
+	return [(s, e, p) for s, e, p in notes], set(open_ties), position
+
+
+def replace_hand_range(
+	notes: list[dict[str, object]],
+	hand: str,
+	first: int,
+	last: int,
+	parsed: list[tuple[int, int, int]],
+	dangling: set[int],
+	total: int,
+	origin: float,
+	grid: float,
+) -> list[dict[str, object]]:
+	"""Replace one hand's notes in slots [first, last) by parsed ones (positions relative to first).
+
+	Notes that began before the range or continue after it stay attached through
+	ties; later notes of the hand move by any change of the range length.
+	"""
+	delta = total - (last - first)
+	result: list[dict[str, object]] = []
+	heads: dict[int, dict[str, object]] = {}
+	tails: dict[int, float] = {}
+	reusable: dict[tuple[int, int], dict[str, object]] = {}
+	for note in notes:
+		if ("left" if note["hand"] == "left" else "right") != hand:
+			result.append(note.copy())
+			continue
+		start = round((float(note["start"]) - origin) / grid)
+		end = max(round((float(note["end"]) - origin) / grid), start + 1)
+		pitch = int(note["midi_note"])
+		if end <= first:
+			result.append(note.copy())
+		elif start >= last:
+			moved = note.copy()
+			moved["start"] = float(note["start"]) + delta * grid
+			moved["end"] = float(note["end"]) + delta * grid
+			result.append(moved)
+		else:
+			if end > last:
+				tails[pitch] = float(note["end"]) + delta * grid
+			if start < first:
+				head = note.copy()
+				head["end"] = origin + first * grid
+				heads[pitch] = head
+				result.append(head)
+			else:
+				reusable[(pitch, start)] = note
+	for start, end, pitch in parsed:
+		absolute_start, absolute_end = first + start, first + end
+		keeps_tail = end == total and pitch in dangling and pitch in tails
+		end_seconds = tails[pitch] if keeps_tail else origin + absolute_end * grid
+		if start == 0 and pitch in heads:
+			heads[pitch]["end"] = end_seconds
+			continue
+		template = reusable.get((pitch, absolute_start))
+		added = template.copy() if template is not None else {"hand": hand, "midi_note": pitch}
+		added["start"] = origin + absolute_start * grid
+		added["end"] = end_seconds
+		result.append(added)
 	return result
 
 
