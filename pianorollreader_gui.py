@@ -1,5 +1,8 @@
 import argparse
+import copy
+import json
 import math
+import os
 import shutil
 import tempfile
 import threading
@@ -105,6 +108,7 @@ from pianorollscore import (
 	video_time_map,
 	find_lilypond,
 	load_layout,
+	svg_page_files,
 	write_score_files,
 )
 from pianorollreader import (
@@ -1331,6 +1335,7 @@ class ScoreView(QWidget):
 		self.playhead: tuple[int, float, float, float] | None = None
 		self.playhead_visible = True
 		self.marks: list[tuple[int, float, float, float, QColor]] = []
+		self.title_override: tuple[QRectF, str] | None = None
 		self.on_click = None
 		self.on_context = None
 		self.on_zoom = None
@@ -1350,6 +1355,7 @@ class ScoreView(QWidget):
 		self.page_rects = []
 		self.playhead = None
 		self.marks = []
+		self.title_override = None
 		self.setFixedSize(400, 300)
 		self.update()
 
@@ -1406,6 +1412,22 @@ class ScoreView(QWidget):
 		self.marks = marks
 		self.update()
 
+	def set_title_override(self, original: str, title: str) -> bool:
+		self.title_override = None
+		if original != title and self.document.pageCount():
+			text = self.document.getAllText(0).text()
+			index = text.find(original)
+			if index < 0:
+				self.update()
+				return False
+			selection = self.document.getSelectionAtIndex(0, index, len(original))
+			if selection.text() != original or selection.boundingRectangle().isEmpty():
+				self.update()
+				return False
+			self.title_override = (selection.boundingRectangle(), title)
+		self.update()
+		return True
+
 	def paintEvent(self, event) -> None:
 		painter = QPainter(self)
 		painter.fillRect(self.rect(), QColor("#8a949c"))
@@ -1414,6 +1436,28 @@ class ScoreView(QWidget):
 				continue
 			painter.fillRect(rect, QColor("#ffffff"))
 			painter.drawImage(rect.topLeft(), image)
+		if self.title_override is not None and self.page_rects:
+			bounds, title = self.title_override
+			page = self.page_rects[0]
+			point_size = self.document.pagePointSize(0)
+			sx, sy = page.width() / point_size.width(), page.height() / point_size.height()
+			original = QRectF(
+				page.left() + bounds.x() * sx, page.top() + bounds.y() * sy,
+				bounds.width() * sx, bounds.height() * sy,
+			)
+			painter.fillRect(original.adjusted(-2 * sx, -2 * sy, 2 * sx, 2 * sy), Qt.GlobalColor.white)
+			font = QFont("Times New Roman")
+			font.setBold(True)
+			font.setPixelSize(max(1, round(bounds.height() * sy * 1.25)))
+			available = page.width() * 0.9
+			while font.pixelSize() > 1 and QFontMetrics(font).horizontalAdvance(title) > available:
+				font.setPixelSize(font.pixelSize() - 1)
+			painter.setFont(font)
+			painter.setPen(Qt.GlobalColor.black)
+			painter.drawText(
+				QRectF(page.left() + page.width() * 0.05, original.top() - 3 * sy, available, original.height() + 6 * sy),
+				Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine, title,
+			)
 		for page, x0, x1, y, color in self.marks:
 			if page >= len(self.page_rects):
 				continue
@@ -1565,14 +1609,24 @@ class ScoreDialog(QDialog):
 		on_jump=None,
 		agility: float | None = None,
 		on_agility=None,
+		project_state=None,
+		on_save_project=None,
+		render_cache=None,
 	) -> None:
 		super().__init__(parent)
 		self.setWindowTitle("Score")
 		self.on_jump = on_jump
 		self.on_agility = on_agility
+		self.on_save_project = on_save_project
+		self.render_cache = render_cache if render_cache is not None else {}
+		self.rendered_title = ""
+		self.export_process: QProcess | None = None
+		self.export_directory: tempfile.TemporaryDirectory | None = None
+		self.pending_export = None
 		self.metronome_enabled = threading.Event()
 		self.edited = False
 		self.edit_base: list[dict[str, object]] | None = None
+		self.reviewed_measures: set[int] = set()
 		self.measure_risks: list[float | None] = []
 		self.uncertain_measures: list[int] = []
 		self.uncertain_cursor = -1
@@ -1616,6 +1670,12 @@ class ScoreDialog(QDialog):
 		self.summary_label = QLabel("Generate the score to see it here.")
 		self.summary_label.setStyleSheet("font-size: 12pt; font-weight: 700;")
 		layout.addWidget(self.summary_label)
+		self.render_progress = QProgressBar()
+		self.render_progress.setRange(0, 0)
+		self.render_progress.setTextVisible(False)
+		self.render_progress.setFixedHeight(8)
+		self.render_progress.hide()
+		layout.addWidget(self.render_progress)
 
 		panel = QWidget(self)
 		panel_layout = QHBoxLayout(panel)
@@ -1682,6 +1742,7 @@ class ScoreDialog(QDialog):
 
 		controls_layout.addWidget(section_heading("Score"))
 		self.title_entry = QLineEdit("Piano roll")
+		self.title_entry.editingFinished.connect(self._title_changed)
 		controls_layout.addWidget(QLabel("Title"))
 		controls_layout.addWidget(self.title_entry)
 		bpm_row = QHBoxLayout()
@@ -1719,10 +1780,22 @@ class ScoreDialog(QDialog):
 		self.generate_button = QPushButton("Generate score")
 		self.generate_button.clicked.connect(self._generate_score)
 		controls_layout.addWidget(self.generate_button)
-		self.save_button = QPushButton("Save PDF and LilyPond files...")
+		self.retry_render_button = QPushButton("Render current score again")
+		self.retry_render_button.setEnabled(False)
+		self.retry_render_button.clicked.connect(self._retry_render)
+		controls_layout.addWidget(self.retry_render_button)
+		self.cancel_render_button = QPushButton("Cancel rendering")
+		self.cancel_render_button.setEnabled(False)
+		self.cancel_render_button.clicked.connect(self._cancel_render)
+		controls_layout.addWidget(self.cancel_render_button)
+		self.save_button = QPushButton("Save PDF, LilyPond and MIDI...")
 		self.save_button.setEnabled(False)
 		self.save_button.clicked.connect(self._save_score)
 		controls_layout.addWidget(self.save_button)
+		if self.on_save_project is not None:
+			project_button = QPushButton("Save project...")
+			project_button.clicked.connect(self._save_project)
+			controls_layout.addWidget(project_button)
 		self.uncertainty_checkbox = QCheckBox("Mark uncertain measures")
 		self.uncertainty_checkbox.setChecked(True)
 		self.uncertainty_checkbox.setToolTip(
@@ -1788,9 +1861,48 @@ class ScoreDialog(QDialog):
 		buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
 		buttons.rejected.connect(self.reject)
 		layout.addWidget(buttons)
+		if project_state is not None:
+			self.reviewed_measures = set(project_state.get("reviewed_measures", []))
+			self.title_entry.setText(project_state["title"])
+			self.bpm_entry.setText(str(project_state["bpm"]))
+			index = self.source_combo.findData(project_state["source"])
+			if index >= 0:
+				self.source_combo.setCurrentIndex(index)
+			self.edited = project_state["edited"]
+			self._compile_notes(
+				copy.deepcopy(project_state["notes"]), project_state["origin"],
+				project_state["bpm"],
+			)
+
+	def project_snapshot(self):
+		if self.score_source is None:
+			return None
+		return {
+			"notes": copy.deepcopy(self.score_notes),
+			"origin": self.score_source.time_origin,
+			"bpm": round(15.0 / self.score_source.grid_seconds),
+			"title": self.title_entry.text(),
+			"source": self.source_combo.currentData(),
+			"edited": self.edited,
+			"reviewed_measures": sorted(self.reviewed_measures),
+		}
+
+	def _save_project(self) -> None:
+		if self.on_save_project is not None:
+			self.on_save_project(self.project_snapshot())
 
 	def _set_status(self, text: str) -> None:
 		self.status_label.setText(text)
+
+	def _title_changed(self) -> None:
+		if self.score_source is None or not self.score_view.images:
+			return
+		title = self.title_entry.text().strip() or "Piano roll"
+		if not self.score_view.set_title_override(self.rendered_title, title):
+			self._set_status("Could not locate the original PDF title for the preview. Export will render the new title.")
+			return
+		if title != self.rendered_title:
+			self._set_status("Title updated. Save the project to keep it; PDF export renders the new title.")
 
 	def _ensure_lilypond(self) -> bool:
 		if self.lilypond_path and Path(self.lilypond_path).exists():
@@ -1805,6 +1917,11 @@ class ScoreDialog(QDialog):
 
 	def _generate_score(self) -> None:
 		if self.process is not None:
+			return
+		if self.edited and QMessageBox.question(
+			self, "Replace edited score",
+			"Generating a new score discards the current score edits. Continue?",
+		) != QMessageBox.StandardButton.Yes:
 			return
 		if not self._ensure_lilypond():
 			self._set_status("LilyPond was not found. Install it or set LILYPOND_PATH.")
@@ -1825,6 +1942,7 @@ class ScoreDialog(QDialog):
 			self.bpm_entry.setText(str(bpm))
 		self.score_notes = notes
 		self.edited = False
+		self.reviewed_measures.clear()
 		self._compile_notes(notes, origin_seconds, bpm)
 
 	def _agility_moved(self, value: int) -> None:
@@ -1864,9 +1982,8 @@ class ScoreDialog(QDialog):
 			)
 		self.score_notes = notes
 		self.video_map = video_time_map(notes)
-		self.score_source = build_score(
-			notes, bpm, origin_seconds, self.title_entry.text().strip() or "Piano roll"
-		)
+		self.rendered_title = self.title_entry.text().strip() or "Piano roll"
+		self.score_source = build_score(notes, bpm, origin_seconds, self.rendered_title)
 		self._cleanup_work_dir()
 		self.work_dir = Path(tempfile.mkdtemp(prefix="pianoroll_score_"))
 		write_score_files(self.score_source, self.work_dir)
@@ -1874,9 +1991,58 @@ class ScoreDialog(QDialog):
 		self.play_button.setEnabled(False)
 		self.save_button.setEnabled(False)
 		self.generate_button.setEnabled(False)
+		self.retry_render_button.setEnabled(False)
 		self.compile_step = 0
-		self.summary_label.setText(f"Compiling {self.score_source.measures} measures with LilyPond...")
+		key = self._render_cache_key()
+		if self.render_cache.get("key") == key:
+			self.rendered_title = self.render_cache["title"]
+			for name, content in self.render_cache["files"].items():
+				(self.work_dir / name).write_bytes(content)
+			self.generate_button.setEnabled(True)
+			self._load_result()
+			return
+		if not self._ensure_lilypond():
+			self.generate_button.setEnabled(True)
+			self.retry_render_button.setEnabled(True)
+			self.summary_label.setText("LilyPond not found. The edited score is retained; locate LilyPond and retry.")
+			return
+		self.cancel_render_button.setEnabled(True)
+		self.render_progress.show()
+		self.summary_label.setText(f"Rendering {self.score_source.measures} measures. Your edits are retained; this can take a while.")
 		self._start_compile_step()
+
+	def _render_cache_key(self):
+		assert self.score_source is not None
+		files = dict(self.score_source.files)
+		main = self.score_source.main_name
+		files[main] = "\n".join(
+			"\\header { title = <title> }" if line.startswith("\\header { title = ") else line
+			for line in files[main].split("\n")
+		)
+		return tuple(sorted(files.items()))
+
+	def _retry_render(self) -> None:
+		if self.process is None and self.score_source is not None:
+			self._compile_notes(
+				self.score_notes, self.score_source.time_origin,
+				round(15.0 / self.score_source.grid_seconds), keep_view=True,
+			)
+
+	def _cancel_render(self) -> None:
+		if self.process is None:
+			return
+		process = self.process
+		self.process = None
+		process.finished.disconnect(self._compile_finished)
+		process.errorOccurred.disconnect(self._compile_error)
+		process.kill()
+		process.waitForFinished(2000)
+		process.deleteLater()
+		self.cancel_render_button.setEnabled(False)
+		self.render_progress.hide()
+		self.generate_button.setEnabled(True)
+		self.retry_render_button.setEnabled(True)
+		self.summary_label.setText("Rendering cancelled. The edited score is retained; retry rendering or save the project.")
 
 	def _start_compile_step(self) -> None:
 		arguments = [
@@ -1898,6 +2064,9 @@ class ScoreDialog(QDialog):
 		self.process.deleteLater()
 		self.process = None
 		self.generate_button.setEnabled(True)
+		self.cancel_render_button.setEnabled(False)
+		self.render_progress.hide()
+		self.retry_render_button.setEnabled(True)
 		self.summary_label.setText("LilyPond could not be started.")
 
 	def _compile_finished(self, exit_code: int, _status) -> None:
@@ -1909,6 +2078,9 @@ class ScoreDialog(QDialog):
 		self.process = None
 		if exit_code != 0:
 			self.generate_button.setEnabled(True)
+			self.cancel_render_button.setEnabled(False)
+			self.render_progress.hide()
+			self.retry_render_button.setEnabled(True)
 			self.summary_label.setText("LilyPond reported an error.")
 			message = QMessageBox(self)
 			message.setIcon(QMessageBox.Icon.Critical)
@@ -1922,6 +2094,8 @@ class ScoreDialog(QDialog):
 			self._start_compile_step()
 			return
 		self.generate_button.setEnabled(True)
+		self.cancel_render_button.setEnabled(False)
+		self.render_progress.hide()
 		self._load_result()
 
 	def _load_result(self) -> None:
@@ -1931,8 +2105,19 @@ class ScoreDialog(QDialog):
 		self._restore_view = None
 		if not self.score_view.load(str(self.work_dir / "score.pdf")):
 			self.summary_label.setText("The compiled PDF could not be loaded.")
+			self.retry_render_button.setEnabled(True)
 			return
 		self.score_layout = load_layout(self.work_dir, self.score_source)
+		try:
+			files = [self.work_dir / "score.pdf", *svg_page_files(self.work_dir, "score")]
+			self.render_cache.clear()
+			self.render_cache.update({
+				"key": self._render_cache_key(),
+				"title": self.rendered_title,
+				"files": {path.name: path.read_bytes() for path in files},
+			})
+		except OSError as error:
+			self._set_status(f"Could not cache the rendered score: {error}")
 		self.start_slot = 0
 		if restore is not None:
 			zoom, scroll_x, scroll_y, self.start_slot = restore
@@ -1944,8 +2129,15 @@ class ScoreDialog(QDialog):
 		elif first_load:
 			self._fit_width()
 		self.play_button.setEnabled(bool(self.score_layout.systems))
-		self.save_button.setEnabled(True)
+		self.save_button.setEnabled(self.export_process is None)
 		self._update_uncertainty_marks()
+		self._update_score_summary()
+		self._set_status("Score ready. Click into the score to choose the start position.")
+		self._title_changed()
+		self._show_start_marker()
+
+	def _update_score_summary(self) -> None:
+		assert self.score_source is not None
 		self.summary_label.setText(
 			f"{self.score_source.measures} measures, "
 			f"{self.score_view.document.pageCount()} page(s), {len(self.score_notes)} notes"
@@ -1954,8 +2146,6 @@ class ScoreDialog(QDialog):
 				if self.uncertain_measures else ""
 			)
 		)
-		self._set_status("Score ready. Click into the score to choose the start position.")
-		self._show_start_marker()
 
 	UNCERTAIN_MEASURE = 0.3
 	VERY_UNCERTAIN_MEASURE = 0.55
@@ -1973,7 +2163,9 @@ class ScoreDialog(QDialog):
 		self.uncertain_measures = [
 			index for index, risk in enumerate(risks)
 			if risk is not None and risk >= self.UNCERTAIN_MEASURE
+			and index not in self.reviewed_measures
 		]
+		self.uncertain_cursor = -1
 		self.next_uncertain_button.setEnabled(bool(self.uncertain_measures))
 		marks: list[tuple[int, float, float, float, QColor]] = []
 		if self.uncertainty_checkbox.isChecked():
@@ -1991,6 +2183,8 @@ class ScoreDialog(QDialog):
 				)
 				marks.append((page, x0, x1, top, color))
 		self.score_view.set_marks(marks)
+		if self.score_view.images:
+			self._update_score_summary()
 
 	def _toggle_uncertainty(self, _checked: bool = False) -> None:
 		if self.score_layout is not None:
@@ -2021,23 +2215,123 @@ class ScoreDialog(QDialog):
 			self.work_dir = None
 
 	def _save_score(self) -> None:
-		if self.score_source is None or self.work_dir is None:
+		if self.score_source is None or self.work_dir is None or self.export_process is not None:
 			return
 		chosen, _ = QFileDialog.getSaveFileName(self, "Save score", "score.pdf", "PDF (*.pdf)")
 		if not chosen:
 			return
 		target = Path(chosen).with_suffix(".pdf")
 		base = target.stem
-		shutil.copyfile(self.work_dir / "score.pdf", target)
-		exported = build_score(
-			self.score_notes,
-			int(self.bpm_entry.text() or 120),
-			self.score_source.time_origin,
-			self.title_entry.text().strip() or "Piano roll",
-			base,
-		)
+		try:
+			bpm = round(15.0 / self.score_source.grid_seconds)
+			exported = build_score(
+				self.score_notes, bpm, self.score_source.time_origin,
+				self.title_entry.text().strip() or "Piano roll", base,
+			)
+			midi = self._score_midi()
+			title = self.title_entry.text().strip() or "Piano roll"
+			if title != self.rendered_title:
+				if not self._ensure_lilypond():
+					self._set_status("LilyPond is required to export the changed title.")
+					return
+				self.export_directory = tempfile.TemporaryDirectory(prefix="pianoroll_export_")
+				directory = Path(self.export_directory.name)
+				write_score_files(exported, directory)
+				self.pending_export = (target, exported, midi)
+				self.export_process = QProcess(self)
+				self.export_process.setWorkingDirectory(str(directory))
+				self.export_process.finished.connect(self._export_finished)
+				self.export_process.errorOccurred.connect(self._export_error)
+				self.save_button.setEnabled(False)
+				self._set_status("Rendering the PDF with the new title for export...")
+				self.export_process.start(str(self.lilypond_path), [
+					"--pdf", "-dno-point-and-click", "-o", base, exported.main_name,
+				])
+				return
+			self._write_score_export(target, exported, midi, self.work_dir / "score.pdf")
+		except (OSError, ValueError) as error:
+			self._cleanup_export()
+			QMessageBox.critical(self, "Score export failed", str(error))
+			return
+
+	def _write_score_export(self, target: Path, exported: ScoreSource, midi: mido.MidiFile, pdf: Path) -> None:
+		shutil.copyfile(pdf, target)
 		write_score_files(exported, target.parent)
-		self._set_status(f"Saved {target.name} and its LilyPond sources.")
+		midi.save(str(target.with_suffix(".mid")))
+		base = target.stem
+		self._set_status(f"Saved {target.name}, LilyPond sources and {base}.mid.")
+
+	def _cleanup_export(self) -> None:
+		if self.export_process is not None:
+			process = self.export_process
+			self.export_process = None
+			process.finished.disconnect(self._export_finished)
+			process.errorOccurred.disconnect(self._export_error)
+			if process.state() != QProcess.ProcessState.NotRunning:
+				process.kill()
+				process.waitForFinished(2000)
+			process.deleteLater()
+		if self.export_directory is not None:
+			self.export_directory.cleanup()
+			self.export_directory = None
+		self.pending_export = None
+		self.save_button.setEnabled(self.score_layout is not None and self.process is None)
+
+	def _export_error(self, _error) -> None:
+		if self.export_process is None or self.export_process.state() != QProcess.ProcessState.NotRunning:
+			return
+		self._cleanup_export()
+		self._set_status("Score export failed: LilyPond could not be started.")
+		QMessageBox.critical(self, "Score export failed", "LilyPond could not be started.")
+
+	def _export_finished(self, exit_code: int, _status) -> None:
+		if self.export_process is None or self.pending_export is None or self.export_directory is None:
+			return
+		output = bytes(self.export_process.readAllStandardError()).decode("utf-8", errors="replace")
+		target, exported, midi = self.pending_export
+		try:
+			if exit_code != 0:
+				raise ValueError(f"LilyPond could not compile the export:\n{output[-4000:]}")
+			self._write_score_export(target, exported, midi, Path(self.export_directory.name) / target.name)
+		except (OSError, ValueError) as error:
+			self._set_status("Score export failed.")
+			QMessageBox.critical(self, "Score export failed", str(error))
+		finally:
+			self._cleanup_export()
+	def _score_midi(self) -> mido.MidiFile:
+		"""Export the same grid and edited notes as the currently displayed score."""
+		assert self.score_source is not None
+		source = self.score_source
+		midi = mido.MidiFile(type=1, ticks_per_beat=480)
+		tempo = round(source.grid_seconds * 4 * 1_000_000)
+		for channel, hand in enumerate(("left", "right")):
+			track = mido.MidiTrack()
+			midi.tracks.append(track)
+			track.append(mido.MetaMessage("track_name", name=f"{hand.title()} hand"))
+			if channel == 0:
+				track.append(mido.MetaMessage("set_tempo", tempo=tempo))
+				track.append(mido.MetaMessage("time_signature", numerator=4, denominator=4))
+			track.append(mido.Message("program_change", channel=channel, program=0))
+			events = []
+			for note in self.score_notes:
+				note_hand = "left" if note["hand"] == "left" else "right"
+				if note_hand != hand:
+					continue
+				start = round((float(note["start"]) - source.time_origin) / source.grid_seconds)
+				end = max(start + 1, round((float(note["end"]) - source.time_origin) / source.grid_seconds))
+				if start < 0:
+					raise ValueError("A score note starts before the score's time origin.")
+				pitch = int(note["midi_note"])
+				events.extend(((start * 120, 1, pitch), (end * 120, 0, pitch)))
+			previous = 0
+			for tick, on, pitch in sorted(events):
+				track.append(mido.Message(
+					"note_on" if on else "note_off", channel=channel, note=pitch,
+					velocity=90 if on else 0, time=tick - previous,
+				))
+				previous = tick
+			track.append(mido.MetaMessage("end_of_track"))
+		return midi
 
 	def _zoom_step(self, direction: int) -> None:
 		self.score_view.set_zoom(self.score_view.zoom * (1.2 if direction > 0 else 1 / 1.2))
@@ -2129,10 +2423,12 @@ class ScoreDialog(QDialog):
 			"QMenu::item:selected { background: #cfe3f1; color: #18212b; }"
 			"QMenu::item:disabled { color: #9aa7b2; }"
 		)
-		edit_action = menu.addAction(
-			f"Edit {midi_note_name(pitch)}..." if pitch is not None else "Edit here..."
-		)
 		measure_action = menu.addAction(f"Edit bar {slot // 16 + 1}...")
+		measure = slot // SLOTS_PER_MEASURE
+		review_action = menu.addAction(
+			f"Mark bar {measure + 1} as unchecked"
+			if measure in self.reviewed_measures else f"Mark bar {measure + 1} as reviewed"
+		)
 		menu.addSeparator()
 		video_action = menu.addAction("Show in video")
 		video_action.setEnabled(self.video_map is not None)
@@ -2141,11 +2437,10 @@ class ScoreDialog(QDialog):
 			self.on_jump is not None and note is not None and "video_seconds" in note
 		)
 		chosen = menu.exec(global_pos)
-		if chosen is edit_action:
+		if chosen is measure_action:
 			self._edit_notes_dialog(hand, slot, pitch)
-		elif chosen is measure_action:
-			first = slot // 16 * 16
-			self._edit_notes_dialog(hand, first, None, bar_only=True)
+		elif chosen is review_action:
+			self._toggle_measure_review(measure)
 		elif chosen is video_action and self.video_map is not None:
 			self.start_slot = slot
 			self._show_start_marker()
@@ -2154,6 +2449,17 @@ class ScoreDialog(QDialog):
 		elif chosen is jump_action and note is not None and self.on_jump is not None:
 			self.on_jump(float(note["video_seconds"]))
 			self.accept()
+
+	def _toggle_measure_review(self, measure: int) -> None:
+		if measure in self.reviewed_measures:
+			self.reviewed_measures.remove(measure)
+			state = "unchecked"
+		else:
+			self.reviewed_measures.add(measure)
+			state = "reviewed"
+		self.edited = True
+		self._update_uncertainty_marks()
+		self._set_status(f"Bar {measure + 1} marked {state}. Save the project to keep this change.")
 
 	def _edit_dialog(self, title: str) -> tuple[QDialog, QVBoxLayout, QVBoxLayout]:
 		"""Dialog with a fixed side column (returned first) and a scrolling main column."""
@@ -2427,10 +2733,12 @@ class ScoreDialog(QDialog):
 			try:
 				parsed, dangling, total = parse_lilypond_hand(editor.toPlainText())
 			except LilypondError as error:
+				state["lilypond_error"] = str(error)
 				status.setStyleSheet("color: #b3261e;")
 				status.setText(str(error))
 				refresh(None, hand)
 				return
+			state["lilypond_error"] = None
 			status.setStyleSheet("color: #53616d;")
 			status.setText(
 				"" if total == 16
@@ -2518,10 +2826,11 @@ class ScoreDialog(QDialog):
 		form.addWidget(QLabel("Pitch"))
 		form.addWidget(pitch_combo)
 		position = QSpinBox()
-		position.setRange(0, self.score_source.total_slots + 64)
-		position.setValue(slot)
+		bar_start = slot // SLOTS_PER_MEASURE * SLOTS_PER_MEASURE
+		position.setRange(0, SLOTS_PER_MEASURE - 1)
+		position.setValue(slot - bar_start)
 		position_label = QLabel("")
-		form.addWidget(QLabel("Start (in sixteenths from the beginning)"))
+		form.addWidget(QLabel("Start (sixteenths from the beginning of this bar; 0-15)"))
 		form.addWidget(position)
 		form.addWidget(position_label)
 		length_combo = QComboBox()
@@ -2534,7 +2843,7 @@ class ScoreDialog(QDialog):
 		form.addWidget(push)
 
 		def update() -> None:
-			start = position.value()
+			start = bar_start + position.value()
 			position_label.setText(f"bar {start // 16 + 1}, beat {start % 16 / 4 + 1:g}")
 			position_label.setStyleSheet("color: #53616d;")
 			video_seconds = (
@@ -2562,11 +2871,12 @@ class ScoreDialog(QDialog):
 			"a note sounding at the position is cut there."
 		))
 		position = QSpinBox()
-		position.setRange(0, self.score_source.total_slots + 64)
-		position.setValue(slot)
+		bar_start = slot // SLOTS_PER_MEASURE * SLOTS_PER_MEASURE
+		position.setRange(0, SLOTS_PER_MEASURE - 1)
+		position.setValue(slot - bar_start)
 		position_label = QLabel("")
 		position_label.setStyleSheet("color: #53616d;")
-		form.addWidget(QLabel("Start (in sixteenths from the beginning)"))
+		form.addWidget(QLabel("Start (sixteenths from the beginning of this bar; 0-15)"))
 		form.addWidget(position)
 		form.addWidget(position_label)
 		length_combo = QComboBox()
@@ -2577,7 +2887,7 @@ class ScoreDialog(QDialog):
 		form.addWidget(length_combo)
 
 		def update() -> None:
-			start = position.value()
+			start = bar_start + position.value()
 			position_label.setText(f"bar {start // 16 + 1}, beat {start % 16 / 4 + 1:g}")
 			edited = insert_break(
 				self._base_notes(), hand, start, int(length_combo.currentData()), origin, grid
@@ -2710,6 +3020,9 @@ class ScoreDialog(QDialog):
 		form.addWidget(QLabel("Action"))
 		action_combo = QComboBox()
 		form.addWidget(action_combo)
+		lilypond_button = QPushButton("Edit LilyPond for selected hand")
+		lilypond_button.setAutoDefault(False)
+		form.addWidget(lilypond_button)
 		stack = QStackedWidget()
 		form.addWidget(stack)
 
@@ -2743,6 +3056,8 @@ class ScoreDialog(QDialog):
 		def choose(index: int) -> None:
 			if 0 <= index < len(updates):
 				stack.setCurrentIndex(index)
+				state["lilypond_error"] = None
+				state["flush"] = updates[index] if action_combo.itemText(index) == "Edit LilyPond" else None
 				updates[index]()
 
 		def rebuild(fresh: bool) -> None:
@@ -2775,6 +3090,8 @@ class ScoreDialog(QDialog):
 				# nothing is pending until the user touches a control
 				stack.setCurrentIndex(0)
 				state["edited"] = None
+				state["flush"] = None
+				state["lilypond_error"] = None
 				refresh(None, str(t_hand))
 			else:
 				choose(0)
@@ -2814,6 +3131,12 @@ class ScoreDialog(QDialog):
 			rebuild(True)
 
 		def commit() -> None:
+			flush = state.get("flush")
+			if callable(flush):
+				flush()
+			if state.get("lilypond_error"):
+				QMessageBox.warning(dialog, "Invalid LilyPond", str(state["lilypond_error"]))
+				return
 			edited = state["edited"]
 			if edited is None:
 				return
@@ -2836,6 +3159,9 @@ class ScoreDialog(QDialog):
 			rebuild(True)
 
 		action_combo.currentIndexChanged.connect(choose)
+		lilypond_button.clicked.connect(
+			lambda: action_combo.setCurrentIndex(action_combo.findText("Edit LilyPond"))
+		)
 		table.itemSelectionChanged.connect(row_selected)
 		add_button.clicked.connect(commit)
 		undo_button.clicked.connect(undo)
@@ -2853,7 +3179,16 @@ class ScoreDialog(QDialog):
 		buttons = QDialogButtonBox(
 			QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
 		)
-		buttons.accepted.connect(dialog.accept)
+		def accept() -> None:
+			flush = state.get("flush")
+			if callable(flush):
+				flush()
+			if state.get("lilypond_error"):
+				QMessageBox.warning(dialog, "Invalid LilyPond", str(state["lilypond_error"]))
+				return
+			dialog.accept()
+
+		buttons.accepted.connect(accept)
 		buttons.rejected.connect(dialog.reject)
 		dialog.outer_layout.addWidget(buttons)  # type: ignore[attr-defined]
 		if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2871,6 +3206,27 @@ class ScoreDialog(QDialog):
 			bpm = int(self.bpm_entry.text())
 		except ValueError:
 			bpm = round(15.0 / self.score_source.grid_seconds)
+		origin = self.score_source.time_origin
+		grid = self.score_source.grid_seconds
+		new_source = build_score(edited, bpm, origin, "review-check")
+		if new_source.time_origin != origin or new_source.grid_seconds != grid:
+			self.reviewed_measures.clear()
+		else:
+			def measure_notes(notes, measure):
+				first = measure * SLOTS_PER_MEASURE
+				last = first + SLOTS_PER_MEASURE
+				signatures = []
+				for note in notes:
+					start = round((float(note["start"]) - origin) / grid)
+					end = max(start + 1, round((float(note["end"]) - origin) / grid))
+					if start < last and end > first:
+						signatures.append((str(note["hand"]), int(note["midi_note"]), start, end))
+				return sorted(signatures)
+
+			self.reviewed_measures = {
+				measure for measure in self.reviewed_measures
+				if measure_notes(self.score_notes, measure) == measure_notes(edited, measure)
+			}
 		self._compile_notes(edited, self.score_source.time_origin, bpm, keep_view=True)
 
 	def _toggle_playback(self) -> None:
@@ -2946,13 +3302,12 @@ class ScoreDialog(QDialog):
 
 	def done(self, result: int) -> None:
 		self._stop_playback()
+		self._cleanup_export()
 		if self.video_capture is not None:
 			self.video_capture.release()
 			self.video_capture = None
 		if self.process is not None:
-			self.process.kill()
-			self.process.waitForFinished(2000)
-			self.process = None
+			self._cancel_render()
 		self._cleanup_work_dir()
 		super().done(result)
 
@@ -2969,9 +3324,16 @@ class DurationAnalysisDialog(QDialog):
 		view_mode: str = "timeline",
 		waterfall_events: list[dict[str, object]] | None = None,
 		on_normalized_accept=None,
+		project_state=None,
+		score_state=None,
+		on_save_project=None,
+		render_cache=None,
 	) -> None:
 		super().__init__(parent)
 		self.view_mode = view_mode
+		self.saved_score_state = score_state
+		self.render_cache = render_cache if render_cache is not None else {}
+		self.on_save_project = on_save_project
 		self.setWindowTitle(
 			"Key Hit Statistics" if view_mode == "statistics" else "Hit Timeline"
 		)
@@ -3317,6 +3679,10 @@ class DurationAnalysisDialog(QDialog):
 		)
 		self.score_button.clicked.connect(self._open_score_dialog)
 		settings.addWidget(self.score_button)
+		if self.on_save_project is not None:
+			project_button = QPushButton("Save project...")
+			project_button.clicked.connect(self._save_project)
+			settings.addWidget(project_button)
 		bpm_row = QHBoxLayout()
 		bpm_row.addWidget(QLabel("BPM"))
 		self.bpm_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3413,6 +3779,56 @@ class DurationAnalysisDialog(QDialog):
 		self.plot_type_label.hide()
 		self.plot_type_combo.hide()
 		self._plot_type_changed(self.plot_type_combo.currentIndex())
+		if project_state is not None:
+			self.restore_project(project_state)
+
+	def project_snapshot(self):
+		return copy.deepcopy({
+			"editable_events": self.editable_events,
+			"quantized_events": self.quantized_events,
+			"music21_quantized_events": self.music21_quantized_events,
+			"quantization_settings": self.quantization_settings,
+			"music21_quantization_settings": self.music21_quantization_settings,
+			"bpm": self.bpm_slider.value(),
+			"beat_length": self.beat_length_combo.currentData(),
+			"reference": self.reference_source_combo.currentData(),
+			"correction": self.correction_combo.currentData(),
+			"agility": self.tempo_agility,
+			"agility_slider": self.agility_slider.value(),
+			"show_quantized": self.plot_quantized_preview,
+			"snap": self.snap_edit_checkbox.isChecked(),
+			"window_start": self.timeline_window_start_seconds,
+		})
+
+	def restore_project(self, state) -> None:
+		self.bpm_slider.setValue(state["bpm"])
+		if state["editable_events"] is not None:
+			self.correction_combo.addItem("Editable copy", "editable")
+			self.playback_source_combo.addItem("Editable copy", "editable")
+		for combo, key in (
+			(self.beat_length_combo, "beat_length"),
+			(self.reference_source_combo, "reference"),
+			(self.correction_combo, "correction"),
+		):
+			index = combo.findData(state[key])
+			if index < 0:
+				raise ValueError(f"Unknown timeline setting: {key}")
+			combo.setCurrentIndex(index)
+		self.set_tempo_agility(state["agility"])
+		self.agility_slider.setValue(state["agility_slider"])
+		for key in (
+			"editable_events", "quantized_events", "music21_quantized_events",
+			"quantization_settings", "music21_quantization_settings",
+		):
+			setattr(self, key, copy.deepcopy(state[key]))
+		self.plot_quantized_preview = state["show_quantized"]
+		self.snap_edit_checkbox.setChecked(state["snap"])
+		self.timeline_window_start_seconds = state["window_start"]
+		self._update_plot()
+
+	def _save_project(self) -> None:
+		if self.on_save_project is not None:
+			self.on_save_project(self.project_snapshot(), self.saved_score_state)
 
 	def _score_sources(self) -> list[tuple[str, str]]:
 		sources: list[tuple[str, str]] = []
@@ -3517,12 +3933,21 @@ class DurationAnalysisDialog(QDialog):
 			on_jump=lambda seconds: setattr(self, "pending_jump", seconds),
 			agility=self.tempo_agility,
 			on_agility=self.set_tempo_agility,
+			project_state=self.saved_score_state,
+			on_save_project=self._save_from_score if self.on_save_project is not None else None,
+			render_cache=self.render_cache,
 		)
 		dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
 		dialog.exec()
+		if dialog.project_snapshot() is not None:
+			self.saved_score_state = dialog.project_snapshot()
 		if self.pending_jump is not None and self.isVisible():
 			seconds, self.pending_jump = self.pending_jump, None
 			self.jump_to_seconds(seconds)
+
+	def _save_from_score(self, score_state) -> None:
+		self.saved_score_state = score_state
+		self._save_project()
 
 	def jump_to_seconds(self, seconds: float) -> None:
 		"""Show the timeline with the given video time near the left of the window."""
@@ -4823,6 +5248,11 @@ class PianoRollReaderWindow(QMainWindow):
 		self.output_path: Path | None = None
 		self.events: list[dict[str, object]] = []
 		self.waterfall_events: list[dict[str, object]] = []
+		self.project_timeline = None
+		self.project_score = None
+		self.score_render_cache = {}
+		self.project_path: Path | None = None
+		self.project_detection_locked = False
 		self.active_waterfall_hits: dict[str, dict[str, object]] = {}
 		self.waterfall_tracker: WaterfallTracker | None = None
 		self.normalized_events: list[dict[str, object]] | None = None
@@ -4863,6 +5293,12 @@ class PianoRollReaderWindow(QMainWindow):
 		self.open_button = QPushButton("Open video")
 		self.open_button.clicked.connect(self.choose_video)
 		toolbar.addWidget(self.open_button)
+		open_project = QPushButton("Open project")
+		open_project.clicked.connect(self.open_project)
+		toolbar.addWidget(open_project)
+		save_project = QPushButton("Save project")
+		save_project.clicked.connect(self.save_project)
+		toolbar.addWidget(save_project)
 		self.play_button = QPushButton("Play")
 		self.play_button.setEnabled(False)
 		self.play_button.clicked.connect(self.toggle_play)
@@ -4995,6 +5431,231 @@ class PianoRollReaderWindow(QMainWindow):
 		if path:
 			self.open_video(Path(path))
 
+	def _save_from_analysis(self, timeline, score) -> None:
+		self.project_timeline = copy.deepcopy(timeline)
+		self.project_score = copy.deepcopy(score)
+		self.save_project()
+
+	def save_project(self) -> None:
+		if self.video_path is None:
+			QMessageBox.information(self, "Save project", "Open a video first.")
+			return
+		chosen, _ = QFileDialog.getSaveFileName(
+			self, "Save project", str(self.project_path or self.video_path.with_suffix(".pianoroll")),
+			"PianoRoll project (*.pianoroll)",
+		)
+		if not chosen:
+			return
+		path = Path(chosen).with_suffix(".pianoroll")
+		data = {
+			"format": "PianoRollReader", "version": 1,
+			"video": str(self.video_path.resolve()), "fps": self.fps,
+			"frame": self.frame_index, "events": self.events,
+			"waterfall_events": self.waterfall_events,
+			"timeline": self.project_timeline, "score": self.project_score,
+			"exports": {
+				"quantized_events": self.quantized_events,
+				"quantization_settings": self.quantization_settings,
+				"music21_quantized_events": self.music21_quantized_events,
+				"music21_quantization_settings": self.music21_quantization_settings,
+				"normalized_events": self.normalized_events,
+				"normalization_settings": self.normalization_settings,
+				"export_normalizations": self.export_normalizations,
+				"timing": self.export_timing_combo.currentData(),
+			},
+		}
+		temp_path = None
+		try:
+			text = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2)
+			with tempfile.NamedTemporaryFile(
+				mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
+			) as temporary:
+				temp_path = Path(temporary.name)
+				temporary.write(text)
+			os.replace(temp_path, path)
+		except (OSError, ValueError, TypeError) as error:
+			if temp_path is not None and temp_path.exists():
+				temp_path.unlink()
+			QMessageBox.critical(self, "Project save failed", str(error))
+			return
+		self.project_path = path
+		self.status_label.setText(f"Project saved: {path.name}")
+
+	def open_project(self) -> None:
+		chosen, _ = QFileDialog.getOpenFileName(
+			self, "Open project", "", "PianoRoll project (*.pianoroll);;All files (*)"
+		)
+		if not chosen:
+			return
+		try:
+			data = json.loads(Path(chosen).read_text(encoding="utf-8"))
+			self._validate_project(data)
+		except (OSError, ValueError, TypeError, KeyError) as error:
+			QMessageBox.critical(self, "Cannot open project", str(error))
+			return
+		video = Path(data["video"])
+		if not video.is_file():
+			replacement, _ = QFileDialog.getOpenFileName(
+				self, "Locate project video", str(video.parent),
+				"Video files (*.mp4 *.avi *.mov *.mkv);;All files (*)",
+			)
+			if not replacement:
+				return
+			video = Path(replacement)
+		probe = cv2.VideoCapture(str(video))
+		if not probe.isOpened():
+			probe.release()
+			QMessageBox.critical(self, "Cannot open project video", str(video))
+			return
+		video_fps = probe.get(cv2.CAP_PROP_FPS)
+		video_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+		probe.release()
+		if not math.isfinite(video_fps) or abs(video_fps - data["fps"]) > 0.001 or data["frame"] >= video_frames:
+			QMessageBox.critical(self, "Video mismatch", "The video FPS or length does not match the project.")
+			return
+		answer = QMessageBox.question(
+			self, "Open project",
+			"Opening a project replaces the current work. Continue?",
+		)
+		if answer != QMessageBox.StandardButton.Yes:
+			return
+		self.open_video(video)
+		if self.capture is None:
+			return
+		self.events = data["events"]
+		self.waterfall_events = data["waterfall_events"]
+		self.project_timeline = data["timeline"]
+		self.project_score = data["score"]
+		self.project_path = Path(chosen)
+		exports = data["exports"]
+		for key in (
+			"quantized_events", "quantization_settings", "music21_quantized_events",
+			"music21_quantization_settings", "normalized_events", "normalization_settings",
+			"export_normalizations",
+		):
+			setattr(self, key, exports[key])
+		for label, key in (("Manual", "manual"), ("music21", "music21"), ("Mean normalized", "normalized")):
+			if self.export_timing_combo.findData(key) < 0:
+				self.export_timing_combo.addItem(label, key)
+		for key in self.export_normalizations:
+			if self.export_timing_combo.findData(key) < 0:
+				self.export_timing_combo.addItem(key, key)
+		index = self.export_timing_combo.findData(exports["timing"])
+		if index >= 0:
+			self.export_timing_combo.setCurrentIndex(index)
+		self.table_flush_timer.stop()
+		self.pending_table_events.clear()
+		self.event_model.clear()
+		for event in self.events:
+			self.event_model.upsert_event(event)
+		self.active_hits.clear()
+		self.active_waterfall_hits.clear()
+		self.waterfall_tracker = None
+		self.frame_index = data["frame"]
+		self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.frame_index)
+		ok, frame = self.capture.read()
+		if ok:
+			self._show_frame(frame, {})
+		self._update_progress()
+		self.play_button.setEnabled(False)
+		self.step_button.setEnabled(False)
+		self.project_detection_locked = True
+		self.status_label.setText("Project loaded. Restart to begin detection again.")
+
+	@staticmethod
+	def _validate_project(data) -> None:
+		if not isinstance(data, dict) or data.get("format") != "PianoRollReader" or data.get("version") != 1:
+			raise ValueError("Unsupported project format or version.")
+		if not isinstance(data["video"], str) or not data["video"]:
+			raise ValueError("Project video path is missing.")
+		if not isinstance(data["fps"], (int, float)) or not math.isfinite(data["fps"]) or data["fps"] <= 0:
+			raise ValueError("Invalid project FPS.")
+		if not isinstance(data["frame"], int) or data["frame"] < 0:
+			raise ValueError("Invalid project frame.")
+		for key in ("events", "waterfall_events"):
+			if not isinstance(data[key], list):
+				raise ValueError(f"Invalid {key}.")
+			for event in data[key]:
+				if not isinstance(event, dict) or not all(
+					field in event for field in ("event_id", "note", "midi_note", "hand", "onset_frame", "offset_frame")
+				):
+					raise ValueError(f"Invalid event in {key}.")
+				if (
+					not isinstance(event["event_id"], int)
+					or not isinstance(event["note"], str)
+					or event["hand"] not in ("left", "right")
+					or not isinstance(event["midi_note"], int)
+					or not 0 <= event["midi_note"] <= 127
+					or not isinstance(event["onset_frame"], int)
+					or event["onset_frame"] < 0
+					or (event["offset_frame"] is not None and (
+						not isinstance(event["offset_frame"], int)
+						or event["offset_frame"] < event["onset_frame"]
+					))
+				):
+					raise ValueError(f"Invalid event values in {key}.")
+		for key in ("timeline", "score"):
+			if data[key] is not None and not isinstance(data[key], dict):
+				raise ValueError(f"Invalid {key} state.")
+		timeline = data["timeline"]
+		if timeline is not None:
+			for key in (
+				"editable_events", "quantized_events", "music21_quantized_events",
+				"quantization_settings", "music21_quantization_settings", "bpm",
+				"beat_length", "reference", "correction", "agility", "agility_slider",
+				"show_quantized", "snap", "window_start",
+			):
+				if key not in timeline:
+					raise ValueError(f"Missing timeline field: {key}")
+			if (
+				not isinstance(timeline["bpm"], int) or not 20 <= timeline["bpm"] <= 300
+				or not isinstance(timeline["agility"], (int, float))
+				or not 0 <= timeline["agility"] <= 1
+				or not isinstance(timeline["agility_slider"], int)
+				or not 0 <= timeline["agility_slider"] <= 100
+				or timeline["correction"] not in ("manual", "music21", "both", "editable")
+				or (timeline["correction"] == "editable" and timeline["editable_events"] is None)
+			):
+				raise ValueError("Invalid timeline settings.")
+			for key in ("editable_events", "quantized_events", "music21_quantized_events"):
+				if timeline[key] is not None and not isinstance(timeline[key], list):
+					raise ValueError(f"Invalid timeline field: {key}")
+		score = data["score"]
+		if score is not None:
+			for key in ("notes", "origin", "bpm", "title", "source", "edited"):
+				if key not in score:
+					raise ValueError(f"Missing score field: {key}")
+			if not isinstance(score["notes"], list) or not isinstance(score["bpm"], int) or not 20 <= score["bpm"] <= 300:
+				raise ValueError("Invalid score notes or tempo.")
+			reviewed = score.get("reviewed_measures", [])
+			if not isinstance(reviewed, list) or any(
+				type(measure) is not int or measure < 0 for measure in reviewed
+			):
+				raise ValueError("Invalid reviewed measures.")
+			for note in score["notes"]:
+				if not isinstance(note, dict) or not all(
+					key in note for key in ("hand", "midi_note", "start", "end")
+				):
+					raise ValueError("Invalid score note.")
+				if (
+					note["hand"] not in ("left", "right")
+					or not isinstance(note["midi_note"], int) or not 0 <= note["midi_note"] <= 127
+					or not isinstance(note["start"], (int, float))
+					or not isinstance(note["end"], (int, float))
+					or not math.isfinite(note["start"]) or not math.isfinite(note["end"])
+					or note["end"] <= note["start"]
+				):
+					raise ValueError("Invalid score note values.")
+		if not isinstance(data["exports"], dict):
+			raise ValueError("Invalid export state.")
+		for key in (
+			"quantized_events", "quantization_settings", "music21_quantized_events",
+			"music21_quantization_settings", "normalized_events", "normalization_settings",
+			"export_normalizations", "timing",
+		):
+			if key not in data["exports"]:
+				raise ValueError(f"Missing export field: {key}")
+
 	def open_video(self, video_path: Path) -> None:
 		self.pause()
 		if self.capture is not None:
@@ -5032,6 +5693,11 @@ class PianoRollReaderWindow(QMainWindow):
 		self.output_label.setText(f"MIDI: {self.output_path}")
 		self.events.clear()
 		self.waterfall_events.clear()
+		self.project_timeline = None
+		self.project_score = None
+		self.score_render_cache.clear()
+		self.project_path = None
+		self.project_detection_locked = False
 		self.active_waterfall_hits.clear()
 		self.waterfall_tracker = None
 		self.normalized_events = None
@@ -5154,7 +5820,20 @@ class PianoRollReaderWindow(QMainWindow):
 	def restart(self) -> None:
 		if self.capture is None:
 			return
+		if self.project_detection_locked:
+			answer = QMessageBox.question(
+				self, "Restart detection",
+				"Restarting discards the loaded detections and editing state. Continue?",
+			)
+			if answer != QMessageBox.StandardButton.Yes:
+				return
+		self.project_detection_locked = False
 		self.pause()
+		self.play_button.setEnabled(True)
+		self.step_button.setEnabled(True)
+		self.project_timeline = None
+		self.project_score = None
+		self.score_render_cache.clear()
 		self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 		self.frame_index = -1
 		self.events.clear()
@@ -5556,8 +6235,14 @@ class PianoRollReaderWindow(QMainWindow):
 			current_frame=self.frame_index,
 			view_mode="timeline",
 			waterfall_events=self.waterfall_events,
+			project_state=self.project_timeline,
+			score_state=self.project_score,
+			on_save_project=self._save_from_analysis,
+			render_cache=self.score_render_cache,
 		)
 		source_dialog._open_score_dialog()
+		self.project_timeline = source_dialog.project_snapshot()
+		self.project_score = source_dialog.saved_score_state
 		jump = source_dialog.pending_jump
 		source_dialog.deleteLater()
 		if jump is not None:
@@ -5581,6 +6266,10 @@ class PianoRollReaderWindow(QMainWindow):
 			on_normalized_accept=(
 				self._set_normalized_export if view_mode == "timeline" else None
 			),
+			project_state=self.project_timeline,
+			score_state=self.project_score,
+			on_save_project=self._save_from_analysis,
+			render_cache=self.score_render_cache,
 		)
 		if view_mode == "timeline":
 			dialog.setWindowState(
@@ -5589,6 +6278,9 @@ class PianoRollReaderWindow(QMainWindow):
 			if jump_seconds is not None:
 				dialog.jump_to_seconds(jump_seconds)
 		dialog.exec()
+		if view_mode == "timeline":
+			self.project_timeline = dialog.project_snapshot()
+		self.project_score = dialog.saved_score_state
 		if was_playing:
 			self.toggle_play()
 
