@@ -14,6 +14,7 @@ import cv2
 import mido
 import numpy as np
 from pianorolltempo import DEFAULT_AGILITY, track_beats
+from pianorolltuplets import format_notation, notation_matches_measure, notation_notes, parse_notation, replace_measure
 from pianorollwaterfall import WaterfallTracker, strike_line, waterfall_segments
 from music21 import note as music21_note
 from music21 import stream as music21_stream
@@ -1532,14 +1533,15 @@ class ExcerptRenderer(QObject):
 		if isinstance(parent, QWidget):
 			parent.destroyed.connect(self.close)
 
-	def request(self, slot: str, notes, origin: float, first_bar: int, callback, mark=None) -> None:
+	def request(self, slot: str, notes, origin: float, first_bar: int, callback, mark=None, notation=None) -> None:
 		key = (
 			first_bar,
 			mark,
+			tuple(sorted((notation or {}).items())),
 			tuple(sorted(
 				(str(n["hand"]), int(n["midi_note"]),
-				 round((float(n["start"]) - origin) / self.grid),
-				 round((float(n["end"]) - origin) / self.grid))
+				 round((float(n["start"]) - origin) / self.grid, 8),
+				 round((float(n["end"]) - origin) / self.grid, 8))
 				for n in notes
 			)),
 		)
@@ -1547,7 +1549,7 @@ class ExcerptRenderer(QObject):
 			self.requests.pop(slot, None)
 			callback(self.cache[key])
 			return
-		self.requests[slot] = (key, notes, origin, first_bar, callback, mark)
+		self.requests[slot] = (key, notes, origin, first_bar, callback, mark, notation)
 		if self.process is None:
 			self._next()
 
@@ -1555,10 +1557,12 @@ class ExcerptRenderer(QObject):
 		if not self.requests:
 			return
 		slot = next(iter(self.requests))
-		key, notes, origin, first_bar, callback, mark = self.requests.pop(slot)
+		key, notes, origin, first_bar, callback, mark, notation = self.requests.pop(slot)
 		self.job += 1
 		directory = self.work_dir / f"job{self.job}"
-		excerpt = build_score(notes, self.bpm, origin, "p", "prev", first_bar=first_bar)
+		excerpt = build_score(
+			notes, self.bpm, origin, "p", "prev", first_bar=first_bar, measure_notation=notation,
+		)
 		if mark is not None:
 			highlight_note(excerpt, *mark)
 		write_score_files(excerpt, directory)
@@ -1626,6 +1630,8 @@ class ScoreDialog(QDialog):
 		self.metronome_enabled = threading.Event()
 		self.edited = False
 		self.edit_base: list[dict[str, object]] | None = None
+		self.measure_notation: dict[tuple[str, int], str] = {}
+		self.edit_notation: dict[tuple[str, int], str] | None = None
 		self.reviewed_measures: set[int] = set()
 		self.measure_risks: list[float | None] = []
 		self.uncertain_measures: list[int] = []
@@ -1863,6 +1869,10 @@ class ScoreDialog(QDialog):
 		layout.addWidget(buttons)
 		if project_state is not None:
 			self.reviewed_measures = set(project_state.get("reviewed_measures", []))
+			self.measure_notation = {
+				(item["hand"], item["measure"]): item["text"]
+				for item in project_state.get("measure_notation", [])
+			}
 			self.title_entry.setText(project_state["title"])
 			self.bpm_entry.setText(str(project_state["bpm"]))
 			index = self.source_combo.findData(project_state["source"])
@@ -1877,7 +1887,7 @@ class ScoreDialog(QDialog):
 	def project_snapshot(self):
 		if self.score_source is None:
 			return None
-		return {
+		state = {
 			"notes": copy.deepcopy(self.score_notes),
 			"origin": self.score_source.time_origin,
 			"bpm": round(15.0 / self.score_source.grid_seconds),
@@ -1886,6 +1896,12 @@ class ScoreDialog(QDialog):
 			"edited": self.edited,
 			"reviewed_measures": sorted(self.reviewed_measures),
 		}
+		if self.measure_notation:
+			state["measure_notation"] = [
+				{"hand": hand, "measure": measure, "text": text}
+				for (hand, measure), text in sorted(self.measure_notation.items())
+			]
+		return state
 
 	def _save_project(self) -> None:
 		if self.on_save_project is not None:
@@ -1943,6 +1959,7 @@ class ScoreDialog(QDialog):
 		self.score_notes = notes
 		self.edited = False
 		self.reviewed_measures.clear()
+		self.measure_notation.clear()
 		self._compile_notes(notes, origin_seconds, bpm)
 
 	def _agility_moved(self, value: int) -> None:
@@ -1983,7 +2000,10 @@ class ScoreDialog(QDialog):
 		self.score_notes = notes
 		self.video_map = video_time_map(notes)
 		self.rendered_title = self.title_entry.text().strip() or "Piano roll"
-		self.score_source = build_score(notes, bpm, origin_seconds, self.rendered_title)
+		self.score_source = build_score(
+			notes, bpm, origin_seconds, self.rendered_title,
+			measure_notation=self.measure_notation,
+		)
 		self._cleanup_work_dir()
 		self.work_dir = Path(tempfile.mkdtemp(prefix="pianoroll_score_"))
 		write_score_files(self.score_source, self.work_dir)
@@ -2227,6 +2247,7 @@ class ScoreDialog(QDialog):
 			exported = build_score(
 				self.score_notes, bpm, self.score_source.time_origin,
 				self.title_entry.text().strip() or "Piano roll", base,
+				measure_notation=self.measure_notation,
 			)
 			midi = self._score_midi()
 			title = self.title_entry.text().strip() or "Piano roll"
@@ -2302,7 +2323,7 @@ class ScoreDialog(QDialog):
 		"""Export the same grid and edited notes as the currently displayed score."""
 		assert self.score_source is not None
 		source = self.score_source
-		midi = mido.MidiFile(type=1, ticks_per_beat=480)
+		midi = mido.MidiFile(type=1, ticks_per_beat=10080 if self.measure_notation else 480)
 		tempo = round(source.grid_seconds * 4 * 1_000_000)
 		for channel, hand in enumerate(("left", "right")):
 			track = mido.MidiTrack()
@@ -2317,12 +2338,24 @@ class ScoreDialog(QDialog):
 				note_hand = "left" if note["hand"] == "left" else "right"
 				if note_hand != hand:
 					continue
-				start = round((float(note["start"]) - source.time_origin) / source.grid_seconds)
-				end = max(start + 1, round((float(note["end"]) - source.time_origin) / source.grid_seconds))
+				ticks_per_slot = midi.ticks_per_beat / 4
+				if self.measure_notation:
+					def tick(value: object, is_end: bool = False) -> int:
+						slot = (float(value) - source.time_origin) / source.grid_seconds
+						bar = math.floor((slot - 1e-8 if is_end else slot + 1e-8) / 16)
+						if (hand, bar) not in self.measure_notation:
+							slot = round(slot)
+						return round(slot * ticks_per_slot)
+					start = tick(note["start"])
+					end = max(start + 1, tick(note["end"], True))
+				else:
+					start_slot = round((float(note["start"]) - source.time_origin) / source.grid_seconds)
+					end_slot = max(start_slot + 1, round((float(note["end"]) - source.time_origin) / source.grid_seconds))
+					start, end = round(start_slot * ticks_per_slot), round(end_slot * ticks_per_slot)
 				if start < 0:
 					raise ValueError("A score note starts before the score's time origin.")
 				pitch = int(note["midi_note"])
-				events.extend(((start * 120, 1, pitch), (end * 120, 0, pitch)))
+				events.extend(((start, 1, pitch), (end, 0, pitch)))
 			previous = 0
 			for tick, on, pitch in sorted(events):
 				track.append(mido.Message(
@@ -2423,8 +2456,8 @@ class ScoreDialog(QDialog):
 			"QMenu::item:selected { background: #cfe3f1; color: #18212b; }"
 			"QMenu::item:disabled { color: #9aa7b2; }"
 		)
-		measure_action = menu.addAction(f"Edit bar {slot // 16 + 1}...")
-		measure = slot // SLOTS_PER_MEASURE
+		measure_action = menu.addAction(f"Edit bar {int(slot // 16) + 1}...")
+		measure = int(slot // SLOTS_PER_MEASURE)
 		review_action = menu.addAction(
 			f"Mark bar {measure + 1} as unchecked"
 			if measure in self.reviewed_measures else f"Mark bar {measure + 1} as reviewed"
@@ -2538,10 +2571,7 @@ class ScoreDialog(QDialog):
 		source = self.score_source
 		assert source is not None
 		origin, grid = source.time_origin, source.grid_seconds
-		try:
-			bpm = int(self.bpm_entry.text())
-		except ValueError:
-			bpm = round(15.0 / grid)
+		bpm = round(15.0 / grid)
 		renderer = ExcerptRenderer(str(self.lilypond_path), bpm, grid, self)
 		form.parentWidget().window().finished.connect(lambda _r: renderer.close())
 
@@ -2556,14 +2586,18 @@ class ScoreDialog(QDialog):
 				pixmap = pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
 			label.setPixmap(pixmap)
 
-		def where(slot: int) -> str:
-			return f"bar {slot // 16 + 1}, beat {slot % 16 / 4 + 1:g}"
+		def where(slot: float) -> str:
+			return f"bar {int(slot // 16) + 1}, beat {slot % 16 / 4 + 1:g}"
 
-		def span(note: dict[str, object]) -> tuple[int, int]:
+		def span(note: dict[str, object]) -> tuple[float, float]:
+			if self.edit_notation or getattr(refresh, "pending_notation", None):
+				start = round((float(note["start"]) - origin) / grid, 7)
+				end = round((float(note["end"]) - origin) / grid, 7)
+				return start, end
 			start = round((float(note["start"]) - origin) / grid)
 			return start, max(round((float(note["end"]) - origin) / grid), start + 1)
 
-		def render(name: str, label: QLabel, notes, first: int, last: int, mark) -> None:
+		def render(name: str, label: QLabel, notes, first: int, last: int, mark, notation) -> None:
 			label.setPixmap(QPixmap())
 			label.setText("Rendering...")
 			renderer.request(
@@ -2573,6 +2607,11 @@ class ScoreDialog(QDialog):
 				first // 16 + 1,
 				lambda image, label=label: show_image(label, image),
 				None if mark is None else (mark[0], mark[1] - first, mark[2]),
+				{
+					(hand, bar - first // 16): text
+					for (hand, bar), text in notation.items()
+					if first // 16 <= bar < last // 16
+				},
 			)
 
 		def set_pending_visible(visible: bool) -> None:
@@ -2591,12 +2630,15 @@ class ScoreDialog(QDialog):
 			if target is None:
 				return
 			base = self._base_notes()
-			score = source if self.edit_base is None else build_score(base, bpm, origin, "preview")
+			notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
+			score = source if self.edit_base is None else build_score(
+				base, bpm, origin, "preview", measure_notation=notation,
+			)
 			views[0].setPlainText(
 				f"% {target[0]} hand, bars {first // 16 + 1}-{last // 16}\n"
 				+ lilypond_excerpt(score, target[0], first, last)
 			)
-			render("current", images[0], base, first, last, target)
+			render("current", images[0], base, first, last, target, notation)
 
 		def current_range() -> tuple[int, int]:
 			target = getattr(refresh, "target", None)
@@ -2668,6 +2710,14 @@ class ScoreDialog(QDialog):
 						f"{old_end - old_start}/16 -> {new_end - new_start}/16"
 					)
 				touched += [old_start, new_start, old_end, new_end]
+			pending_notation = getattr(refresh, "pending_notation", None)
+			current_notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
+			if pending_notation is not None and pending_notation != current_notation and not touched:
+				target = getattr(refresh, "target", None)
+				if target is not None:
+					first = int(target[1] // 16) * 16
+					touched.extend((first, first + 15))
+					lines.append("Changed the measure notation.")
 			refresh.last_lines = list(lines)
 			if len(lines) > MAX_LISTED:
 				lines = lines[:MAX_LISTED] + [f"... and {len(lines) - MAX_LISTED} more changes"]
@@ -2676,16 +2726,19 @@ class ScoreDialog(QDialog):
 				clear()
 				show_current(*current_range())
 				return
-			first = min(touched) // 16 * 16
-			last = min(first + PREVIEW_BARS * 16, (max(touched) // 16 + 1) * 16)
+			first = int(min(touched) // 16) * 16
+			last = min(first + PREVIEW_BARS * 16, (int(max(touched) // 16) + 1) * 16)
 			set_pending_visible(True)
 			show_current(first, last)
-			preview = build_score(new_notes, bpm, origin, "preview")
+			notation = getattr(refresh, "pending_notation", None)
+			if notation is None:
+				notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
+			preview = build_score(new_notes, bpm, origin, "preview", measure_notation=notation)
 			views[1].setPlainText(
 				f"% {hand} hand, bars {first // 16 + 1}-{last // 16}\n"
 				+ lilypond_excerpt(preview, hand, first, last)
 			)
-			render("pending", images[1], new_notes, first, last, None)
+			render("pending", images[1], new_notes, first, last, None, notation)
 
 		refresh.last_lines = []
 		refresh.target = None
@@ -2694,6 +2747,41 @@ class ScoreDialog(QDialog):
 	def _base_notes(self) -> list[dict[str, object]]:
 		"""Notes the edit dialog currently works on (score notes plus queued edits)."""
 		return self.edit_base if self.edit_base is not None else self.score_notes
+
+	def _preview_grid_edit(self, edited, hand, refresh, state, removed=None, shift_from=None):
+		"""Reject grid edits that would desynchronize stored tuplet notation."""
+		assert self.score_source is not None
+		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
+		notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
+		error = None
+		if edited is not None:
+			for (note_hand, measure), text in sorted(notation.items()):
+				if note_hand != hand:
+					continue
+				first = origin + measure * SLOTS_PER_MEASURE * grid
+				last = first + SLOTS_PER_MEASURE * grid
+				def overlapping(notes):
+					return sorted(
+						(int(note["midi_note"]), float(note["start"]), float(note["end"]))
+						for note in notes
+						if note["hand"] == hand
+						and float(note["start"]) < last - grid * 1e-7
+						and float(note["end"]) > first + grid * 1e-7
+					)
+				if (shift_from is not None and shift_from < (measure + 1) * SLOTS_PER_MEASURE
+					or overlapping(self._base_notes()) != overlapping(edited)
+					or not notation_matches_measure(edited, hand, measure, parse_notation(text), origin, grid)):
+					error = (
+						f"This edit would change or move the {hand}-hand tuplet in bar {measure + 1}. "
+						"Edit that bar with LilyPond instead."
+					)
+					break
+		state["grid_error"] = error
+		notify = state.get("show_grid_error")
+		if callable(notify):
+			notify(error or "")
+		state["edited"] = edited if error is None else None
+		refresh(state["edited"], hand, removed if error is None else None)
 
 	def _page(self) -> tuple[QWidget, QVBoxLayout]:
 		page = QWidget()
@@ -2706,15 +2794,18 @@ class ScoreDialog(QDialog):
 		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
 		page, form = self._page()
 		first, last = measure * 16, measure * 16 + 16
-		try:
-			bpm = int(self.bpm_entry.text())
-		except ValueError:
-			bpm = round(15.0 / grid)
+		bpm = round(15.0 / grid)
 		base = self._base_notes()
-		excerpt = lilypond_excerpt(build_score(base, bpm, origin, "edit", first_bar=1), hand, first, last)
+		notation_base = self.edit_notation if self.edit_notation is not None else self.measure_notation
+		excerpt = notation_base.get((hand, measure))
+		if excerpt is None:
+			excerpt = lilypond_excerpt(
+				build_score(base, bpm, origin, "edit", first_bar=1, measure_notation=notation_base),
+				hand, first, last,
+			)
 		form.addWidget(QLabel(
 			f"LilyPond of the {hand} hand, bar {measure + 1} (c' = middle C, durations in 16ths). "
-			"Notes tied across the bar lines stay attached."
+			"Notes tied across the bar lines stay attached. Supports non-nested 3-, 5- and 7-tuplets."
 		))
 		editor = QPlainTextEdit(excerpt)
 		editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -2730,8 +2821,25 @@ class ScoreDialog(QDialog):
 		def update() -> None:
 			timer.stop()
 			state["edited"] = None
+			state["notation"] = None
+			refresh.pending_notation = None
 			try:
-				parsed, dangling, total = parse_lilypond_hand(editor.toPlainText())
+				text = editor.toPlainText()
+				if "\\tuplet" in text or "\\times" in text or notation_base:
+					notation = parse_notation(text)
+					edited = replace_measure(base, hand, measure, notation, origin, grid)
+					pending_notation = dict(notation_base)
+					if notation.groups:
+						pending_notation[(hand, measure)] = format_notation(notation)
+					else:
+						pending_notation.pop((hand, measure), None)
+					total = notation.length
+				else:
+					parsed, dangling, total = parse_lilypond_hand(text)
+					if notation_base and total != 16:
+						raise LilypondError("A bar must have four beats while the score contains tuplets.")
+					edited = replace_hand_range(base, hand, first, last, parsed, dangling, total, origin, grid)
+					pending_notation = dict(notation_base)
 			except LilypondError as error:
 				state["lilypond_error"] = str(error)
 				status.setStyleSheet("color: #b3261e;")
@@ -2739,20 +2847,22 @@ class ScoreDialog(QDialog):
 				refresh(None, hand)
 				return
 			state["lilypond_error"] = None
+			state["notation"] = pending_notation
+			refresh.pending_notation = pending_notation
 			status.setStyleSheet("color: #53616d;")
 			status.setText(
 				"" if total == 16
 				else f"Bar length is {total}/16: following notes of this hand move accordingly."
-			)
-			edited = replace_hand_range(
-				base, hand, first, last, parsed, dangling, total, origin, grid
 			)
 			refresh(edited, hand, generic=True)
 			if getattr(refresh, "last_lines", None):
 				state["edited"] = edited
 
 		timer.timeout.connect(update)
-		editor.textChanged.connect(timer.start)
+		def text_changed() -> None:
+			state["flush"] = update
+			timer.start()
+		editor.textChanged.connect(text_changed)
 		return page, update
 
 	def _adjust_duration_page(self, hand: str, slot: int, length: int, pitch: int | None, refresh, state):
@@ -2804,8 +2914,10 @@ class ScoreDialog(QDialog):
 					self._base_notes(), hand, slot, new_length, pause.isChecked(), origin, grid,
 					pitch, not single,
 				)
-			state["edited"] = edited
-			refresh(edited, hand)
+			shift_from = None
+			if edited is not None and not single and (new_length > length or not pause.isChecked()):
+				shift_from = slot + min(length, new_length)
+			self._preview_grid_edit(edited, hand, refresh, state, shift_from=shift_from)
 
 		combo.currentIndexChanged.connect(update)
 		pause.toggled.connect(update)
@@ -2826,9 +2938,9 @@ class ScoreDialog(QDialog):
 		form.addWidget(QLabel("Pitch"))
 		form.addWidget(pitch_combo)
 		position = QSpinBox()
-		bar_start = slot // SLOTS_PER_MEASURE * SLOTS_PER_MEASURE
+		bar_start = int(slot // SLOTS_PER_MEASURE) * SLOTS_PER_MEASURE
 		position.setRange(0, SLOTS_PER_MEASURE - 1)
-		position.setValue(slot - bar_start)
+		position.setValue(round(slot - bar_start))
 		position_label = QLabel("")
 		form.addWidget(QLabel("Start (sixteenths from the beginning of this bar; 0-15)"))
 		form.addWidget(position)
@@ -2853,8 +2965,9 @@ class ScoreDialog(QDialog):
 				self._base_notes(), hand, int(pitch_combo.currentData()), start,
 				int(length_combo.currentData()), push.isChecked(), origin, grid, video_seconds,
 			)
-			state["edited"] = edited
-			refresh(edited, hand)
+			self._preview_grid_edit(
+				edited, hand, refresh, state, shift_from=start if push.isChecked() else None,
+			)
 
 		pitch_combo.currentIndexChanged.connect(update)
 		length_combo.currentIndexChanged.connect(update)
@@ -2871,9 +2984,9 @@ class ScoreDialog(QDialog):
 			"a note sounding at the position is cut there."
 		))
 		position = QSpinBox()
-		bar_start = slot // SLOTS_PER_MEASURE * SLOTS_PER_MEASURE
+		bar_start = int(slot // SLOTS_PER_MEASURE) * SLOTS_PER_MEASURE
 		position.setRange(0, SLOTS_PER_MEASURE - 1)
-		position.setValue(slot - bar_start)
+		position.setValue(round(slot - bar_start))
 		position_label = QLabel("")
 		position_label.setStyleSheet("color: #53616d;")
 		form.addWidget(QLabel("Start (sixteenths from the beginning of this bar; 0-15)"))
@@ -2892,8 +3005,7 @@ class ScoreDialog(QDialog):
 			edited = insert_break(
 				self._base_notes(), hand, start, int(length_combo.currentData()), origin, grid
 			)
-			state["edited"] = edited
-			refresh(edited, hand)
+			self._preview_grid_edit(edited, hand, refresh, state, shift_from=start)
 
 		length_combo.currentIndexChanged.connect(update)
 		position.valueChanged.connect(update)
@@ -2929,11 +3041,12 @@ class ScoreDialog(QDialog):
 				self._base_notes(), hand, slot, pitch, close.isChecked() and alone, origin, grid
 			)
 			if result is None:
-				state["edited"] = None
-				refresh(None, hand)
+				self._preview_grid_edit(None, hand, refresh, state)
 				return
-			state["edited"] = result[0]
-			refresh(result[0], hand, result[1])
+			self._preview_grid_edit(
+				result[0], hand, refresh, state, result[1],
+				shift_from=end if close.isChecked() and alone else None,
+			)
 
 		close.toggled.connect(update)
 		return page, update
@@ -2958,8 +3071,7 @@ class ScoreDialog(QDialog):
 
 		def update() -> None:
 			edited = remove_break(self._base_notes(), hand, slot, amount.value(), origin, grid)
-			state["edited"] = edited
-			refresh(edited, hand)
+			self._preview_grid_edit(edited, hand, refresh, state, shift_from=gap[1] - amount.value())
 
 		amount.valueChanged.connect(update)
 		return page, update
@@ -2973,6 +3085,17 @@ class ScoreDialog(QDialog):
 		last = first + 16
 		rows: list[tuple[str, int, int | None, int]] = []
 		for hand in ("right", "left"):
+			notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
+			text = notation.get((hand, measure))
+			if text is not None:
+				for event in parse_notation(text).events:
+					start = first + float(event.start)
+					length = float(event.duration)
+					if event.pitches:
+						rows.extend((hand, start, pitch, length) for pitch in event.pitches)
+					else:
+						rows.append((hand, start, None, length))
+				continue
 			entries = []
 			for note in base:
 				if ("left" if note["hand"] == "left" else "right") != hand:
@@ -2997,13 +3120,20 @@ class ScoreDialog(QDialog):
 		"""Edit a bar: pick a note or break, stack any number of edits, apply them together."""
 		assert self.score_source is not None
 		origin, grid = self.score_source.time_origin, self.score_source.grid_seconds
-		measure = slot // 16
+		measure = int(slot // 16)
 		dialog, side, form = self._edit_dialog(f"Edit bar {measure + 1}")
 		self.edit_base = None
+		self.edit_notation = dict(self.measure_notation)
 		target = {"hand": hand, "slot": slot, "pitch": pitch}
-		history: list[list[dict[str, object]] | None] = []
+		history = []
 
 		side.addWidget(QLabel(f"Bar {measure + 1}: select a note or break."))
+		notice = QLabel(
+			"This hand and bar contain tuplets. Edit this bar with LilyPond to preserve their timing."
+		)
+		notice.setWordWrap(True)
+		notice.setVisible(False)
+		side.addWidget(notice)
 		table = QTableWidget(0, 4)
 		table.setHorizontalHeaderLabels(["Hand", "Beat", "Note", "Length"])
 		table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -3023,6 +3153,10 @@ class ScoreDialog(QDialog):
 		lilypond_button = QPushButton("Edit LilyPond for selected hand")
 		lilypond_button.setAutoDefault(False)
 		form.addWidget(lilypond_button)
+		grid_error = QLabel()
+		grid_error.setStyleSheet("color: #b3261e;")
+		grid_error.setWordWrap(True)
+		form.addWidget(grid_error)
 		stack = QStackedWidget()
 		form.addWidget(stack)
 
@@ -3041,7 +3175,7 @@ class ScoreDialog(QDialog):
 		side.addWidget(queue_list, 2)
 
 		refresh = self._edit_preview(form)
-		state: dict[str, object] = {"edited": None}
+		state: dict[str, object] = {"edited": None, "show_grid_error": grid_error.setText}
 		updates: list = []
 		rows: list[tuple[str, int, int | None, int]] = []
 
@@ -3057,13 +3191,19 @@ class ScoreDialog(QDialog):
 			if 0 <= index < len(updates):
 				stack.setCurrentIndex(index)
 				state["lilypond_error"] = None
+				state["grid_error"] = None
+				grid_error.clear()
+				state["notation"] = None
+				refresh.pending_notation = None
 				state["flush"] = updates[index] if action_combo.itemText(index) == "Edit LilyPond" else None
 				updates[index]()
 
 		def rebuild(fresh: bool) -> None:
 			"""Recreate the action pages for the selected target on the current notes."""
 			t_hand, t_slot, t_pitch = target["hand"], target["slot"], target["pitch"]
-			refresh.target = (str(t_hand), int(t_slot), t_pitch)
+			protected_bar = (t_hand, measure) in self.edit_notation
+			notice.setVisible(protected_bar)
+			refresh.target = (str(t_hand), t_slot, t_pitch)
 			action_combo.blockSignals(True)
 			action_combo.clear()
 			while stack.count():
@@ -3076,14 +3216,15 @@ class ScoreDialog(QDialog):
 				current_length(base, t_hand, t_slot, origin, grid, t_pitch)
 				if t_pitch is not None else None
 			)
-			if length is not None:
-				add("Adjust duration", self._adjust_duration_page(t_hand, t_slot, length, t_pitch, refresh, state))
-			add("Insert note", self._insert_note_page(t_hand, t_slot, t_pitch, refresh, state))
-			add("Insert break", self._insert_break_page(t_hand, t_slot, refresh, state))
-			if t_pitch is not None:
-				add("Remove note", self._remove_note_page(t_hand, t_slot, t_pitch, refresh, state))
-			else:
-				add("Remove break", self._remove_break_page(t_hand, t_slot, refresh, state))
+			if not protected_bar:
+				if length is not None:
+					add("Adjust duration", self._adjust_duration_page(t_hand, t_slot, length, t_pitch, refresh, state))
+				add("Insert note", self._insert_note_page(t_hand, t_slot, t_pitch, refresh, state))
+				add("Insert break", self._insert_break_page(t_hand, t_slot, refresh, state))
+				if t_pitch is not None:
+					add("Remove note", self._remove_note_page(t_hand, t_slot, t_pitch, refresh, state))
+				else:
+					add("Remove break", self._remove_break_page(t_hand, t_slot, refresh, state))
 			add("Edit LilyPond", self._lilypond_page(str(t_hand), int(t_slot) // 16, refresh, state))
 			action_combo.blockSignals(False)
 			if fresh:
@@ -3106,12 +3247,12 @@ class ScoreDialog(QDialog):
 					row_hand,
 					f"{start % 16 / 4 + 1:g}",
 					midi_note_name(row_pitch) if row_pitch is not None else "break",
-					f"{length}/16",
+					f"{length:g}/16",
 				)
 				for column, value in enumerate(values):
 					table.setItem(index, column, QTableWidgetItem(value))
 				same_target = (
-					start <= int(target["slot"]) < start + length
+					start <= target["slot"] < start + length
 					if row_pitch is None else start == target["slot"]
 				)
 				if (row_hand, row_pitch) == (target["hand"], target["pitch"]) and same_target and selected < 0:
@@ -3137,13 +3278,18 @@ class ScoreDialog(QDialog):
 			if state.get("lilypond_error"):
 				QMessageBox.warning(dialog, "Invalid LilyPond", str(state["lilypond_error"]))
 				return
+			if state.get("grid_error"):
+				QMessageBox.warning(dialog, "Cannot apply edit", str(state["grid_error"]))
+				return
 			edited = state["edited"]
 			if edited is None:
 				return
 			lines = list(getattr(refresh, "last_lines", []))
 			summary = (lines[0] if lines else "edit") + (f" (+{len(lines) - 1} more)" if len(lines) > 1 else "")
-			history.append(self.edit_base)
+			history.append((self.edit_base, self.edit_notation))
 			self.edit_base = edited
+			if state.get("notation") is not None:
+				self.edit_notation = state["notation"]
 			queue_list.addItem(summary)
 			undo_button.setEnabled(True)
 			fill_table()
@@ -3152,16 +3298,21 @@ class ScoreDialog(QDialog):
 		def undo() -> None:
 			if not history:
 				return
-			self.edit_base = history.pop()
+			self.edit_base, self.edit_notation = history.pop()
 			queue_list.takeItem(queue_list.count() - 1)
 			undo_button.setEnabled(bool(history))
 			fill_table()
 			rebuild(True)
 
 		action_combo.currentIndexChanged.connect(choose)
-		lilypond_button.clicked.connect(
-			lambda: action_combo.setCurrentIndex(action_combo.findText("Edit LilyPond"))
-		)
+		def open_lilypond() -> None:
+			index = action_combo.findText("Edit LilyPond")
+			if action_combo.currentIndex() == index:
+				choose(index)
+			else:
+				action_combo.setCurrentIndex(index)
+
+		lilypond_button.clicked.connect(open_lilypond)
 		table.itemSelectionChanged.connect(row_selected)
 		add_button.clicked.connect(commit)
 		undo_button.clicked.connect(undo)
@@ -3174,6 +3325,7 @@ class ScoreDialog(QDialog):
 			self._run_edit_dialog(dialog, state)
 		finally:
 			self.edit_base = None
+			self.edit_notation = None
 
 	def _run_edit_dialog(self, dialog: QDialog, state: dict[str, object]) -> None:
 		buttons = QDialogButtonBox(
@@ -3186,6 +3338,9 @@ class ScoreDialog(QDialog):
 			if state.get("lilypond_error"):
 				QMessageBox.warning(dialog, "Invalid LilyPond", str(state["lilypond_error"]))
 				return
+			if state.get("grid_error"):
+				QMessageBox.warning(dialog, "Cannot apply edit", str(state["grid_error"]))
+				return
 			dialog.accept()
 
 		buttons.accepted.connect(accept)
@@ -3196,6 +3351,12 @@ class ScoreDialog(QDialog):
 		# a pending edit already contains the queued ones, since it builds on them
 		final = state["edited"] if state["edited"] is not None else self.edit_base
 		if final is not None:
+			notation = state.get("notation") if state["edited"] is not None else self.edit_notation
+			if notation is not None:
+				for key in self.measure_notation.keys() | notation.keys():
+					if self.measure_notation.get(key) != notation.get(key):
+						self.reviewed_measures.discard(key[1])
+				self.measure_notation = notation
 			self._apply_edit(final)
 
 	def _apply_edit(self, edited: list[dict[str, object]]) -> None:
@@ -3206,9 +3367,14 @@ class ScoreDialog(QDialog):
 			bpm = int(self.bpm_entry.text())
 		except ValueError:
 			bpm = round(15.0 / self.score_source.grid_seconds)
+		if self.measure_notation:
+			bpm = round(15.0 / self.score_source.grid_seconds)
+			self.bpm_entry.setText(str(bpm))
 		origin = self.score_source.time_origin
 		grid = self.score_source.grid_seconds
-		new_source = build_score(edited, bpm, origin, "review-check")
+		new_source = build_score(
+			edited, bpm, origin, "review-check", measure_notation=self.measure_notation,
+		)
 		if new_source.time_origin != origin or new_source.grid_seconds != grid:
 			self.reviewed_measures.clear()
 		else:
@@ -3217,8 +3383,8 @@ class ScoreDialog(QDialog):
 				last = first + SLOTS_PER_MEASURE
 				signatures = []
 				for note in notes:
-					start = round((float(note["start"]) - origin) / grid)
-					end = max(start + 1, round((float(note["end"]) - origin) / grid))
+					start = round((float(note["start"]) - origin) / grid, 7)
+					end = round((float(note["end"]) - origin) / grid, 7)
 					if start < last and end > first:
 						signatures.append((str(note["hand"]), int(note["midi_note"]), start, end))
 				return sorted(signatures)
@@ -5448,7 +5614,8 @@ class PianoRollReaderWindow(QMainWindow):
 			return
 		path = Path(chosen).with_suffix(".pianoroll")
 		data = {
-			"format": "PianoRollReader", "version": 1,
+			"format": "PianoRollReader",
+			"version": 2 if self.project_score and self.project_score.get("measure_notation") else 1,
 			"video": str(self.video_path.resolve()), "fps": self.fps,
 			"frame": self.frame_index, "events": self.events,
 			"waterfall_events": self.waterfall_events,
@@ -5564,7 +5731,7 @@ class PianoRollReaderWindow(QMainWindow):
 
 	@staticmethod
 	def _validate_project(data) -> None:
-		if not isinstance(data, dict) or data.get("format") != "PianoRollReader" or data.get("version") != 1:
+		if not isinstance(data, dict) or data.get("format") != "PianoRollReader" or data.get("version") not in (1, 2):
 			raise ValueError("Unsupported project format or version.")
 		if not isinstance(data["video"], str) or not data["video"]:
 			raise ValueError("Project video path is missing.")
@@ -5632,6 +5799,25 @@ class PianoRollReaderWindow(QMainWindow):
 				type(measure) is not int or measure < 0 for measure in reviewed
 			):
 				raise ValueError("Invalid reviewed measures.")
+			notation_items = score.get("measure_notation", [])
+			if not isinstance(notation_items, list) or (notation_items and data["version"] != 2):
+				raise ValueError("Invalid score notation or project version.")
+			seen_notation = set()
+			for item in notation_items:
+				if not isinstance(item, dict) or item.get("hand") not in ("left", "right"):
+					raise ValueError("Invalid notation hand.")
+				measure = item.get("measure")
+				text = item.get("text")
+				if type(measure) is not int or measure < 0 or not isinstance(text, str):
+					raise ValueError("Invalid measure notation.")
+				key = (item["hand"], measure)
+				if key in seen_notation:
+					raise ValueError("Duplicate measure notation.")
+				seen_notation.add(key)
+				parsed = parse_notation(text)
+				if parsed.length != 16 or not parsed.groups:
+					raise ValueError("Invalid tuplet measure notation.")
+				notation_notes(parsed)
 			for note in score["notes"]:
 				if not isinstance(note, dict) or not all(
 					key in note for key in ("hand", "midi_note", "start", "end")
@@ -5646,6 +5832,16 @@ class PianoRollReaderWindow(QMainWindow):
 					or note["end"] <= note["start"]
 				):
 					raise ValueError("Invalid score note values.")
+			if notation_items:
+				origin = score["origin"]
+				if not isinstance(origin, (int, float)) or not math.isfinite(origin):
+					raise ValueError("Invalid score origin.")
+				for item in notation_items:
+					if not notation_matches_measure(
+						score["notes"], item["hand"], item["measure"],
+						parse_notation(item["text"]), origin, 15.0 / score["bpm"],
+					):
+						raise ValueError("Stored measure notation does not match score notes.")
 		if not isinstance(data["exports"], dict):
 			raise ValueError("Invalid export state.")
 		for key in (

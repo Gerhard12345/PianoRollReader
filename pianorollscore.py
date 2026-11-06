@@ -16,6 +16,10 @@ import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+	from pianorolltuplets import ParsedNotation
 
 SLOTS_PER_MEASURE = 16
 PITCH_NAMES = ["c", "cis", "d", "dis", "e", "f", "fis", "g", "gis", "a", "ais", "b"]
@@ -121,14 +125,57 @@ def hand_pieces(notes: list[tuple[int, int, int]], total_slots: int) -> list[Pie
 
 
 def render_hand(
-	variable: str, clef: str, pieces: list[Piece]
-) -> tuple[str, dict[int, int], set[tuple[int, int]], dict[tuple[int, int], int]]:
+	variable: str, clef: str, pieces: list[Piece], overrides: dict[int, ParsedNotation] | None = None,
+) -> tuple[str, dict[int, float], set[tuple[int, int]], dict[tuple[int, int], int]]:
 	"""Return the LilyPond text, a {line: slot} map, tie columns and {(line, column): pitch}."""
 	lines = [f"{variable} = {{", f"  \\clef {clef}"]
-	line_slots: dict[int, int] = {}
+	line_slots: dict[int, float] = {}
 	tie_columns: set[tuple[int, int]] = set()
 	pitch_columns: dict[tuple[int, int], int] = {}
+	override_bars = overrides or {}
+	rendered_bars = set()
 	for piece in pieces:
+		bar = piece.slot // SLOTS_PER_MEASURE
+		if bar in override_bars:
+			if bar in rendered_bars:
+				continue
+			rendered_bars.add(bar)
+			notation = override_bars[bar]
+			active_group = None
+			for event in notation.events:
+				if event.group != active_group:
+					if active_group is not None:
+						lines.append("  }")
+					active_group = event.group
+					if active_group is not None:
+						group = notation.groups[active_group]
+						lines.append(f"  \\tuplet {group.notes}/{group.in_time_of} {{")
+				if not event.pitches:
+					text = "r" + event.written_duration
+					offsets = []
+				elif len(event.pitches) == 1:
+					pitch = event.pitches[0]
+					text = lilypond_pitch(pitch) + event.written_duration + ("~" if pitch in event.ties else "")
+					offsets = [(2, pitch)]
+				else:
+					tokens = []
+					offsets = []
+					position = 3
+					for pitch in event.pitches:
+						token = lilypond_pitch(pitch) + ("~" if pitch in event.ties else "")
+						tokens.append(token)
+						offsets.append((position, pitch))
+						position += len(token) + 1
+					text = f"<{' '.join(tokens)}>{event.written_duration}"
+				lines.append(f"  {text}")
+				line = len(lines)
+				line_slots[line] = float(bar * SLOTS_PER_MEASURE + event.start)
+				tie_columns.update((line, col) for col, char in enumerate(lines[-1]) if char == "~")
+				pitch_columns.update(((line, col), pitch) for col, pitch in offsets)
+			if active_group is not None:
+				lines.append("  }")
+			lines.append("  |")
+			continue
 		duration = DURATION_NAMES[piece.length]
 		offsets: list[tuple[int, int]] = []
 		if not piece.pitches:
@@ -165,7 +212,7 @@ class ScoreSource:
 
 	main_name: str
 	files: dict[str, str]
-	line_slots: dict[tuple[str, int], int]
+	line_slots: dict[tuple[str, int], float]
 	tie_columns: set[tuple[str, int, int]]
 	time_origin: float
 	grid_seconds: float
@@ -181,6 +228,7 @@ def build_score(
 	title: str,
 	base: str = "score",
 	first_bar: int | None = None,
+	measure_notation: dict[tuple[str, int], str] | None = None,
 ) -> ScoreSource:
 	"""notes: dicts with hand ('left'/'right'), midi_note, start, end in seconds.
 
@@ -190,27 +238,47 @@ def build_score(
 	grid = 60.0 / bpm / 4
 	converted: dict[str, list[tuple[int, int, int]]] = {"left": [], "right": []}
 	for note in notes:
-		start = round((float(note["start"]) - origin_seconds) / grid)
-		end = round((float(note["end"]) - origin_seconds) / grid)
-		end = max(end, start + 1)
+		exact_start = (float(note["start"]) - origin_seconds) / grid
+		exact_end = (float(note["end"]) - origin_seconds) / grid
+		start = round(exact_start)
+		end = round(exact_end)
 		hand = "left" if note["hand"] == "left" else "right"
+		bar = int((exact_start + 1e-8) // SLOTS_PER_MEASURE)
+		bar_end = (bar + 1) * SLOTS_PER_MEASURE
+		if measure_notation and (hand, bar) in measure_notation and exact_end <= bar_end + 1e-8:
+			start = min(start, bar_end - 1)
+			end = min(end, bar_end)
+		end = max(end, start + 1)
 		converted[hand].append((start, end, int(note["midi_note"])))
 	all_starts = [start for hand_notes in converted.values() for start, _, _ in hand_notes]
 	shift = (min(all_starts) // SLOTS_PER_MEASURE) * SLOTS_PER_MEASURE if all_starts else 0
-	if first_bar is not None:
+	if first_bar is not None or measure_notation:
 		shift = 0
 	for hand, hand_notes in converted.items():
 		converted[hand] = [(s - shift, e - shift, m) for s, e, m in hand_notes]
 	last_end = max((end for hand_notes in converted.values() for _, end, _ in hand_notes), default=0)
-	measures = max(1, -(-last_end // SLOTS_PER_MEASURE))
+	overrides = {}
+	if measure_notation:
+		from pianorolltuplets import notation_notes, parse_notation
+		for (hand, bar), text in measure_notation.items():
+			if hand not in ("left", "right") or not isinstance(bar, int) or bar < 0:
+				raise LilypondError("Invalid hand or measure in stored notation.")
+			notation = parse_notation(text)
+			if notation.length != SLOTS_PER_MEASURE:
+				raise LilypondError("Stored measure notation must have exactly four beats.")
+			notation_notes(notation)
+			overrides[(hand, bar)] = notation
+	measures = max(1, -(-last_end // SLOTS_PER_MEASURE), max((bar + 1 for _, bar in overrides), default=0))
 	total_slots = measures * SLOTS_PER_MEASURE
 
 	right_name, left_name = f"{base}_right.ly", f"{base}_left.ly"
 	right_text, right_lines, right_ties, right_pitches = render_hand(
-		"rightHand", "treble", hand_pieces(converted["right"], total_slots)
+		"rightHand", "treble", hand_pieces(converted["right"], total_slots),
+		{bar: notation for (hand, bar), notation in overrides.items() if hand == "right"},
 	)
 	left_text, left_lines, left_ties, left_pitches = render_hand(
-		"leftHand", "bass", hand_pieces(converted["left"], total_slots)
+		"leftHand", "bass", hand_pieces(converted["left"], total_slots),
+		{bar: notation for (hand, bar), notation in overrides.items() if hand == "left"},
 	)
 	safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
 	if first_bar is None:
@@ -292,10 +360,17 @@ def lilypond_excerpt(source: ScoreSource, hand: str, first_slot: int, last_slot:
 		line for (file, line), slot in source.line_slots.items()
 		if file == name and first_slot <= slot < last_slot
 	)
-	return "\n".join(lines[line - 1].strip() for line in chosen)
+	if not chosen:
+		return ""
+	first, last = chosen[0] - 1, chosen[-1] - 1
+	if first > 0 and lines[first - 1].strip().startswith("\\tuplet "):
+		first -= 1
+	if last + 1 < len(lines) and lines[last + 1].strip() == "}":
+		last += 1
+	return "\n".join(line.strip() for line in lines[first:last + 1])
 
 
-def highlight_note(source: ScoreSource, hand: str, slot: int, pitch: int | None) -> None:
+def highlight_note(source: ScoreSource, hand: str, slot: float, pitch: int | None) -> None:
 	"""Colour the note head (or rest) at a slot red in the generated LilyPond text."""
 	name = f"{source.main_name.removesuffix('.ly')}_{hand}.ly"
 	lines = source.files[name].splitlines()
@@ -370,38 +445,43 @@ class SystemLayout:
 	bottom: float
 	left: float
 	right: float
-	anchors: list[tuple[int, float]] = field(default_factory=list)
+	anchors: list[tuple[float, float]] = field(default_factory=list)
 	split: float | None = None
 	# per hand: (slot, x, y, pitch or None for rests) of every note head and rest
-	points: dict[str, list[tuple[int, float, float, int | None]]] = field(default_factory=dict)
+	points: dict[str, list[tuple[float, float, float, int | None]]] = field(default_factory=dict)
 
 
 def _find_targets(
 	notes: list[dict[str, object]],
 	hand: str,
-	slot: int,
+	slot: float,
 	origin: float,
 	grid: float,
 	pitch: int | None = None,
-) -> tuple[dict[int, tuple[int, int]], list[int]]:
-	spans: dict[int, tuple[int, int]] = {}
+) -> tuple[dict[int, tuple[float, float]], list[int]]:
+	spans: dict[int, tuple[float, float]] = {}
 	for index, note in enumerate(notes):
 		if ("left" if note["hand"] == "left" else "right") != hand:
 			continue
-		start = round((float(note["start"]) - origin) / grid)
-		spans[index] = (start, max(round((float(note["end"]) - origin) / grid), start + 1))
+		if isinstance(slot, float) and not slot.is_integer():
+			start = round((float(note["start"]) - origin) / grid, 7)
+			end = round((float(note["end"]) - origin) / grid, 7)
+		else:
+			start = round((float(note["start"]) - origin) / grid)
+			end = max(round((float(note["end"]) - origin) / grid), start + 1)
+		spans[index] = (start, end)
 	active = [
 		i for i, (start, end) in spans.items()
-		if start <= slot < end and (pitch is None or int(notes[i]["midi_note"]) == pitch)
+		if start - 1e-6 <= slot < end - 1e-6 and (pitch is None or int(notes[i]["midi_note"]) == pitch)
 	]
-	targets = [i for i in active if spans[i][0] == slot] or active
+	targets = [i for i in active if abs(spans[i][0] - slot) < 1e-6] or active
 	return spans, targets
 
 
 def find_note(
 	notes: list[dict[str, object]],
 	hand: str,
-	slot: int,
+	slot: float,
 	origin: float,
 	grid: float,
 	pitch: int | None = None,
@@ -803,7 +883,7 @@ class ScoreLayout:
 	systems: list[SystemLayout]
 	total_slots: int
 
-	def _first_slots(self) -> list[int]:
+	def _first_slots(self) -> list[float]:
 		return [system.anchors[0][0] for system in self.systems]
 
 	def locate(self, slot: float) -> tuple[int, float, float, float] | None:
@@ -825,12 +905,12 @@ class ScoreLayout:
 				slot_b, x_b = firsts[system_index + 1], system.right
 			else:
 				slot_b, x_b = self.total_slots, system.right
-			fraction = min(1.0, max(0.0, (slot - slot_a) / max(1, slot_b - slot_a)))
+			fraction = min(1.0, max(0.0, (slot - slot_a) / max(1e-12, slot_b - slot_a)))
 			x = x_a + fraction * (x_b - x_a)
 		width, height = self.page_sizes[system.page]
 		return system.page, x / width, system.top / height, system.bottom / height
 
-	def slot_at(self, page: int, fx: float, fy: float) -> int | None:
+	def slot_at(self, page: int, fx: float, fy: float) -> float | None:
 		"""Nearest slot for a click given as page fractions."""
 		candidates = [system for system in self.systems if system.page == page]
 		if not candidates:
@@ -845,7 +925,7 @@ class ScoreLayout:
 		anchor = min(system.anchors, key=lambda item: abs(item[1] - x))
 		return anchor[0]
 
-	def hit_test(self, page: int, fx: float, fy: float) -> tuple[str, int, int | None] | None:
+	def hit_test(self, page: int, fx: float, fy: float) -> tuple[str, float, int | None] | None:
 		"""Return (hand, slot, pitch) of the note head or rest nearest to a click."""
 		candidates = [system for system in self.systems if system.page == page]
 		if not candidates:
@@ -957,7 +1037,7 @@ def load_layout(directory: Path, source: ScoreSource) -> ScoreLayout:
 			)
 			for pair in (staves[index:index + 2] for index in range(0, len(staves), 2))
 		]
-		by_slot: list[tuple[int, float, float]] = []
+		by_slot: list[tuple[float, float, float]] = []
 		hand_of_slot: list[str] = []
 		pitch_of_slot: list[int | None] = []
 		for name, line, column, x, y in raw_anchors:
@@ -968,7 +1048,7 @@ def load_layout(directory: Path, source: ScoreSource) -> ScoreLayout:
 				by_slot.append((slot, x, y))
 				hand_of_slot.append("right" if name.endswith("_right.ly") else "left")
 				pitch_of_slot.append(source.pitch_columns.get((name, line, column)))
-		grouped: dict[tuple[int, int], list[float]] = {}
+		grouped: dict[tuple[int, float], list[float]] = {}
 		for (slot, x, y), hand, pitch in zip(by_slot, hand_of_slot, pitch_of_slot):
 			if not page_systems:
 				break

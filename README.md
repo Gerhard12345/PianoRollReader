@@ -5,8 +5,17 @@
 Right-click a measure and choose **Edit bar**. Select a note or rest to choose
 the hand and edit target. **Edit LilyPond for selected hand** opens the
 LilyPond editor for that hand and measure; it supports the generated note,
-chord, rest, duration and tie syntax on the sixteenth-note grid, not arbitrary
-LilyPond commands. Add several edits to the list or apply the pending edit with
+chord, rest, duration and tie syntax, plus non-nested 3-, 5- and 7-tuplets,
+not arbitrary LilyPond commands. For example, enter
+`\tuplet 3/2 { c'8 d' e' } r2.` or `\times 2/3 { c'8 d' e' } r2.`.
+The supported written durations range from whole notes to sixteenths;
+tuplets may contain chords, rests and ties. A bar containing a tuplet must
+total four beats. The normal editing actions remain available in other bars
+and in the other hand. For a hand and bar containing tuplets, use LilyPond;
+grid edits that would change or shift a tuplet in a later bar are rejected
+to preserve its notation and timing. A tie ending a tuplet bar
+must continue a note already held across the bar line.
+Add several edits to the list or apply the pending edit with
 OK. Insertion positions are zero-based sixteenths within the selected measure
 (0–15).
 
@@ -34,6 +43,9 @@ edited notes and settings. Edits in the measure dialog must first be applied
 with OK. The project stores a video path, not the video itself; if the video
 has moved, select it when opening the project. LilyPond is required to
 re-render a saved score.
+Existing version-1 projects remain supported. Projects containing tuplets are
+saved as version 2 so older releases reject them instead of silently losing
+their rhythmic notation.
 
 While LilyPond renders, the score dialog shows an activity bar (not a
 percentage). Rendering may be cancelled and retried without discarding the
