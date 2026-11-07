@@ -14,6 +14,8 @@ import cv2
 import mido
 import numpy as np
 from pianorolltempo import DEFAULT_AGILITY, track_beats
+from pianorolldetection import BLACK_HUE_FIELDS, DEFAULT_PROFILE, KEY_SATURATION_FIELDS, score_frame, validate_profile, waterfall_hues
+from pianorollprofiles import DetectionProfileDialog
 from pianorolltuplets import format_notation, notation_matches_measure, notation_notes, parse_notation, replace_measure
 from pianorollwaterfall import WaterfallTracker, strike_line, waterfall_segments
 from music21 import note as music21_note
@@ -88,6 +90,9 @@ from PySide6.QtWidgets import (
 from pianorollscore import (
 	ScoreLayout,
 	ScoreSource,
+	DEFAULT_KEY_SIGNATURE,
+	KEY_SIGNATURES,
+	KEY_FIFTHS,
 	LilypondError,
 	highlight_note,
 	parse_lilypond_hand,
@@ -1524,6 +1529,7 @@ class ExcerptRenderer(QObject):
 		self.lilypond_path = lilypond_path
 		self.bpm = bpm
 		self.grid = grid_seconds
+		self.key_signature = parent.score_source.key_signature if isinstance(parent, ScoreDialog) and parent.score_source is not None else DEFAULT_KEY_SIGNATURE
 		self.work_dir = Path(tempfile.mkdtemp(prefix="pianoroll_preview_"))
 		self.cache: dict[tuple, QImage | None] = {}
 		self.requests: dict[str, tuple] = {}
@@ -1562,6 +1568,7 @@ class ExcerptRenderer(QObject):
 		directory = self.work_dir / f"job{self.job}"
 		excerpt = build_score(
 			notes, self.bpm, origin, "p", "prev", first_bar=first_bar, measure_notation=notation,
+			key_signature=self.key_signature,
 		)
 		if mark is not None:
 			highlight_note(excerpt, *mark)
@@ -1751,10 +1758,20 @@ class ScoreDialog(QDialog):
 		self.title_entry.editingFinished.connect(self._title_changed)
 		controls_layout.addWidget(QLabel("Title"))
 		controls_layout.addWidget(self.title_entry)
+		controls_layout.addWidget(QLabel("Key signature"))
+		self.key_combo = QComboBox()
+		for label, key, _fifths in KEY_SIGNATURES:
+			self.key_combo.addItem(label, key)
+		self.key_combo.setCurrentIndex(self.key_combo.findData(DEFAULT_KEY_SIGNATURE))
+		controls_layout.addWidget(self.key_combo)
 		bpm_row = QHBoxLayout()
 		bpm_row.addWidget(QLabel("BPM"))
 		self.bpm_entry = QLineEdit(str(bpm))
 		self.bpm_entry.setValidator(QIntValidator(20, 300, self))
+		self.bpm_entry.setToolTip(
+			"Score tempo. Normalized and quantized sources retain their rhythmic positions "
+			"and are rescaled to this tempo; raw and editable timings use their existing seconds."
+		)
 		self.bpm_entry.setFixedWidth(64)
 		bpm_row.addWidget(self.bpm_entry)
 		bpm_row.addStretch(1)
@@ -1875,6 +1892,7 @@ class ScoreDialog(QDialog):
 			}
 			self.title_entry.setText(project_state["title"])
 			self.bpm_entry.setText(str(project_state["bpm"]))
+			self.key_combo.setCurrentIndex(self.key_combo.findData(project_state.get("key_signature", DEFAULT_KEY_SIGNATURE)))
 			index = self.source_combo.findData(project_state["source"])
 			if index >= 0:
 				self.source_combo.setCurrentIndex(index)
@@ -1883,6 +1901,7 @@ class ScoreDialog(QDialog):
 				copy.deepcopy(project_state["notes"]), project_state["origin"],
 				project_state["bpm"],
 			)
+		self.key_combo.currentIndexChanged.connect(self._key_signature_changed)
 
 	def project_snapshot(self):
 		if self.score_source is None:
@@ -1901,7 +1920,18 @@ class ScoreDialog(QDialog):
 				{"hand": hand, "measure": measure, "text": text}
 				for (hand, measure), text in sorted(self.measure_notation.items())
 			]
+		if self.score_source.key_signature != DEFAULT_KEY_SIGNATURE:
+			state["key_signature"] = self.score_source.key_signature
 		return state
+
+	def _key_signature_changed(self) -> None:
+		if self.score_source is None or self.process is not None:
+			return
+		self._stop_playback()
+		self._compile_notes(
+			self.score_notes, self.score_source.time_origin,
+			round(15.0 / self.score_source.grid_seconds), keep_view=True,
+		)
 
 	def _save_project(self) -> None:
 		if self.on_save_project is not None:
@@ -1934,6 +1964,13 @@ class ScoreDialog(QDialog):
 	def _generate_score(self) -> None:
 		if self.process is not None:
 			return
+		try:
+			bpm = int(self.bpm_entry.text())
+		except ValueError:
+			bpm = 0
+		if not 20 <= bpm <= 300:
+			QMessageBox.warning(self, "Invalid tempo", "Enter a tempo between 20 and 300 BPM.")
+			return
 		if self.edited and QMessageBox.question(
 			self, "Replace edited score",
 			"Generating a new score discards the current score edits. Continue?",
@@ -1948,14 +1985,16 @@ class ScoreDialog(QDialog):
 		if not notes:
 			QMessageBox.information(self, "No notes", "The selected source contains no completed notes.")
 			return
-		try:
-			bpm = int(self.bpm_entry.text())
-		except ValueError:
-			bpm = 120
 		if grid_bpm is not None and grid_bpm != bpm:
-			# Times of this source lie on its own BPM grid; any other value shifts notes.
-			bpm = grid_bpm
-			self.bpm_entry.setText(str(bpm))
+			scale = grid_bpm / bpm
+			notes = [
+				{
+					**note,
+					"start": origin_seconds + (float(note["start"]) - origin_seconds) * scale,
+					"end": origin_seconds + (float(note["end"]) - origin_seconds) * scale,
+				}
+				for note in notes
+			]
 		self.score_notes = notes
 		self.edited = False
 		self.reviewed_measures.clear()
@@ -2003,6 +2042,7 @@ class ScoreDialog(QDialog):
 		self.score_source = build_score(
 			notes, bpm, origin_seconds, self.rendered_title,
 			measure_notation=self.measure_notation,
+			key_signature=str(self.key_combo.currentData()),
 		)
 		self._cleanup_work_dir()
 		self.work_dir = Path(tempfile.mkdtemp(prefix="pianoroll_score_"))
@@ -2027,6 +2067,7 @@ class ScoreDialog(QDialog):
 			self.summary_label.setText("LilyPond not found. The edited score is retained; locate LilyPond and retry.")
 			return
 		self.cancel_render_button.setEnabled(True)
+		self.key_combo.setEnabled(False)
 		self.render_progress.show()
 		self.summary_label.setText(f"Rendering {self.score_source.measures} measures. Your edits are retained; this can take a while.")
 		self._start_compile_step()
@@ -2062,6 +2103,7 @@ class ScoreDialog(QDialog):
 		self.render_progress.hide()
 		self.generate_button.setEnabled(True)
 		self.retry_render_button.setEnabled(True)
+		self.key_combo.setEnabled(True)
 		self.summary_label.setText("Rendering cancelled. The edited score is retained; retry rendering or save the project.")
 
 	def _start_compile_step(self) -> None:
@@ -2085,6 +2127,7 @@ class ScoreDialog(QDialog):
 		self.process = None
 		self.generate_button.setEnabled(True)
 		self.cancel_render_button.setEnabled(False)
+		self.key_combo.setEnabled(True)
 		self.render_progress.hide()
 		self.retry_render_button.setEnabled(True)
 		self.summary_label.setText("LilyPond could not be started.")
@@ -2099,6 +2142,7 @@ class ScoreDialog(QDialog):
 		if exit_code != 0:
 			self.generate_button.setEnabled(True)
 			self.cancel_render_button.setEnabled(False)
+			self.key_combo.setEnabled(True)
 			self.render_progress.hide()
 			self.retry_render_button.setEnabled(True)
 			self.summary_label.setText("LilyPond reported an error.")
@@ -2115,6 +2159,7 @@ class ScoreDialog(QDialog):
 			return
 		self.generate_button.setEnabled(True)
 		self.cancel_render_button.setEnabled(False)
+		self.key_combo.setEnabled(True)
 		self.render_progress.hide()
 		self._load_result()
 
@@ -2248,6 +2293,7 @@ class ScoreDialog(QDialog):
 				self.score_notes, bpm, self.score_source.time_origin,
 				self.title_entry.text().strip() or "Piano roll", base,
 				measure_notation=self.measure_notation,
+				key_signature=self.score_source.key_signature,
 			)
 			midi = self._score_midi()
 			title = self.title_entry.text().strip() or "Piano roll"
@@ -2632,7 +2678,7 @@ class ScoreDialog(QDialog):
 			base = self._base_notes()
 			notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
 			score = source if self.edit_base is None else build_score(
-				base, bpm, origin, "preview", measure_notation=notation,
+				base, bpm, origin, "preview", measure_notation=notation, key_signature=source.key_signature,
 			)
 			views[0].setPlainText(
 				f"% {target[0]} hand, bars {first // 16 + 1}-{last // 16}\n"
@@ -2733,7 +2779,7 @@ class ScoreDialog(QDialog):
 			notation = getattr(refresh, "pending_notation", None)
 			if notation is None:
 				notation = self.edit_notation if self.edit_notation is not None else self.measure_notation
-			preview = build_score(new_notes, bpm, origin, "preview", measure_notation=notation)
+			preview = build_score(new_notes, bpm, origin, "preview", measure_notation=notation, key_signature=source.key_signature)
 			views[1].setPlainText(
 				f"% {hand} hand, bars {first // 16 + 1}-{last // 16}\n"
 				+ lilypond_excerpt(preview, hand, first, last)
@@ -2800,7 +2846,7 @@ class ScoreDialog(QDialog):
 		excerpt = notation_base.get((hand, measure))
 		if excerpt is None:
 			excerpt = lilypond_excerpt(
-				build_score(base, bpm, origin, "edit", first_bar=1, measure_notation=notation_base),
+				build_score(base, bpm, origin, "edit", first_bar=1, measure_notation=notation_base, key_signature=self.score_source.key_signature),
 				hand, first, last,
 			)
 		form.addWidget(QLabel(
@@ -3373,7 +3419,7 @@ class ScoreDialog(QDialog):
 		origin = self.score_source.time_origin
 		grid = self.score_source.grid_seconds
 		new_source = build_score(
-			edited, bpm, origin, "review-check", measure_notation=self.measure_notation,
+			edited, bpm, origin, "review-check", measure_notation=self.measure_notation, key_signature=self.score_source.key_signature,
 		)
 		if new_source.time_origin != origin or new_source.grid_seconds != grid:
 			self.reviewed_measures.clear()
@@ -4031,8 +4077,10 @@ class DurationAnalysisDialog(QDialog):
 					self._selected_grid_origin_frame(),
 				)
 				origin = float(settings["origin_seconds"])
+				grid_bpm = int(settings["bpm"])
 			elif self.quantization_settings is not None:
 				origin = float(self.quantization_settings["origin_seconds"])
+				grid_bpm = int(self.quantization_settings["bpm"])
 		elif key == "music21":
 			events = self.music21_quantized_events
 			if events is None:
@@ -4044,6 +4092,9 @@ class DurationAnalysisDialog(QDialog):
 					self.current_frame,
 					self._selected_grid_origin_frame(),
 				)
+				grid_bpm = self.bpm_slider.value()
+			elif self.music21_quantization_settings is not None:
+				grid_bpm = int(self.music21_quantization_settings["bpm"])
 			if events:
 				origin = float(events[0].get("music21_origin_seconds", origin))
 		elif key.startswith("normalized"):
@@ -5408,6 +5459,7 @@ class PianoRollReaderWindow(QMainWindow):
 		self.keys: list[dict[str, object]] = []
 		self.key_masks: list[np.ndarray] = []
 		self.key_width = 0.0
+		self.detection_profile = copy.deepcopy(DEFAULT_PROFILE)
 		self.fps = 30.0
 		self.frame_count = 0
 		self.frame_index = -1
@@ -5477,6 +5529,10 @@ class PianoRollReaderWindow(QMainWindow):
 		self.restart_button.setEnabled(False)
 		self.restart_button.clicked.connect(self.restart)
 		toolbar.addWidget(self.restart_button)
+		self.profile_button = QPushButton("Detection profile")
+		self.profile_button.setEnabled(False)
+		self.profile_button.clicked.connect(self.edit_detection_profile)
+		toolbar.addWidget(self.profile_button)
 		self.audio_checkbox = QCheckBox("Play audio")
 		self.audio_checkbox.setToolTip(
 			"Play the video's sound while processing. Processing slower than real time "
@@ -5619,6 +5675,7 @@ class PianoRollReaderWindow(QMainWindow):
 			"video": str(self.video_path.resolve()), "fps": self.fps,
 			"frame": self.frame_index, "events": self.events,
 			"waterfall_events": self.waterfall_events,
+			"detection_profile": self.detection_profile,
 			"timeline": self.project_timeline, "score": self.project_score,
 			"exports": {
 				"quantized_events": self.quantized_events,
@@ -5631,6 +5688,14 @@ class PianoRollReaderWindow(QMainWindow):
 				"timing": self.export_timing_combo.currentData(),
 			},
 		}
+		if self.detection_profile != DEFAULT_PROFILE:
+			data["version"] = 3
+		if any(key in self.detection_profile for key in BLACK_HUE_FIELDS):
+			data["version"] = 4
+		if any(key in self.detection_profile for key in KEY_SATURATION_FIELDS):
+			data["version"] = 5
+		if self.project_score and self.project_score.get("key_signature", DEFAULT_KEY_SIGNATURE) != DEFAULT_KEY_SIGNATURE:
+			data["version"] = 6
 		temp_path = None
 		try:
 			text = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2)
@@ -5689,6 +5754,7 @@ class PianoRollReaderWindow(QMainWindow):
 		self.open_video(video)
 		if self.capture is None:
 			return
+		self.detection_profile = validate_profile(data.get("detection_profile", DEFAULT_PROFILE))
 		self.events = data["events"]
 		self.waterfall_events = data["waterfall_events"]
 		self.project_timeline = data["timeline"]
@@ -5731,8 +5797,17 @@ class PianoRollReaderWindow(QMainWindow):
 
 	@staticmethod
 	def _validate_project(data) -> None:
-		if not isinstance(data, dict) or data.get("format") != "PianoRollReader" or data.get("version") not in (1, 2):
+		if not isinstance(data, dict) or data.get("format") != "PianoRollReader" or data.get("version") not in (1, 2, 3, 4, 5, 6):
 			raise ValueError("Unsupported project format or version.")
+		profile = validate_profile(data.get("detection_profile", DEFAULT_PROFILE))
+		if data["version"] in (3, 4, 5, 6) and "detection_profile" not in data:
+			raise ValueError("Project detection profile is missing.")
+		if profile != DEFAULT_PROFILE and data["version"] not in (3, 4, 5, 6):
+			raise ValueError("Custom detection profiles require project version 3.")
+		if any(key in profile for key in BLACK_HUE_FIELDS) and data["version"] not in (4, 5, 6):
+			raise ValueError("Black-key color profiles require project version 4.")
+		if any(key in profile for key in KEY_SATURATION_FIELDS) and data["version"] not in (5, 6):
+			raise ValueError("Key saturation profiles require project version 5.")
 		if not isinstance(data["video"], str) or not data["video"]:
 			raise ValueError("Project video path is missing.")
 		if not isinstance(data["fps"], (int, float)) or not math.isfinite(data["fps"]) or data["fps"] <= 0:
@@ -5789,6 +5864,11 @@ class PianoRollReaderWindow(QMainWindow):
 					raise ValueError(f"Invalid timeline field: {key}")
 		score = data["score"]
 		if score is not None:
+			key_signature = score.get("key_signature", DEFAULT_KEY_SIGNATURE)
+			if not isinstance(key_signature, str) or key_signature not in KEY_FIFTHS:
+				raise ValueError("Invalid score key signature.")
+			if key_signature != DEFAULT_KEY_SIGNATURE and data["version"] != 6:
+				raise ValueError("Score key signatures require project version 6.")
 			for key in ("notes", "origin", "bpm", "title", "source", "edited"):
 				if key not in score:
 					raise ValueError(f"Missing score field: {key}")
@@ -5800,7 +5880,7 @@ class PianoRollReaderWindow(QMainWindow):
 			):
 				raise ValueError("Invalid reviewed measures.")
 			notation_items = score.get("measure_notation", [])
-			if not isinstance(notation_items, list) or (notation_items and data["version"] != 2):
+			if not isinstance(notation_items, list) or (notation_items and data["version"] not in (2, 3, 4, 5, 6)):
 				raise ValueError("Invalid score notation or project version.")
 			seen_notation = set()
 			for item in notation_items:
@@ -5911,6 +5991,7 @@ class PianoRollReaderWindow(QMainWindow):
 			self.play_button,
 			self.step_button,
 			self.restart_button,
+			self.profile_button,
 			self.save_button,
 			self.timeline_button,
 			self.statistics_button,
@@ -5945,31 +6026,36 @@ class PianoRollReaderWindow(QMainWindow):
 			self.key_masks.append(mask > 0)
 
 	def _score_frame(self, frame: np.ndarray) -> dict[str, str]:
-		if self.baseline_frame is None or self.baseline_frame.shape != frame.shape:
-			return {}
-		pressed: dict[str, str] = {}
-		for key, interior_mask in zip(self.keys, self.key_masks):
-			x, y, width, height = key["bbox"]
-			mask_pixel_count = np.count_nonzero(interior_mask)
-			if not mask_pixel_count:
-				continue
-			frame_region = frame[y : y + height, x : x + width]
-			baseline_region = self.baseline_frame[y : y + height, x : x + width]
-			region_hsv = cv2.cvtColor(frame_region, cv2.COLOR_BGR2HSV)
-			color_delta = cv2.absdiff(frame_region, baseline_region).max(axis=2)
-			changed_region = (region_hsv[:, :, 1] > 100) & (color_delta > 80)
-			interior_changes = changed_region & interior_mask
-			if np.count_nonzero(interior_changes) / mask_pixel_count < 0.55:
-				continue
-			hues = region_hsv[:, :, 0][interior_changes]
-			cyan_fraction = float(((hues >= 85) & (hues <= 110)).mean())
-			green_fraction = float(((hues >= 45) & (hues <= 80)).mean())
-			if max(cyan_fraction, green_fraction) < 0.5:
-				continue
-			pressed[str(key["note"])] = (
-				"left" if cyan_fraction > green_fraction else "right"
+		return score_frame(frame, self.baseline_frame, self.keys, self.key_masks, self.detection_profile)
+
+	def edit_detection_profile(self) -> None:
+		if self.video_path is None or self.baseline_frame is None:
+			return
+		self.pause()
+		try:
+			dialog = DetectionProfileDialog(
+				self.video_path, self.frame_index, self.baseline_frame, self.keys,
+				self.key_masks, self.key_width, self.detection_profile, self,
 			)
-		return pressed
+		except (OSError, ValueError) as error:
+			QMessageBox.critical(self, "Detection profiles", str(error))
+			return
+		if dialog.exec() != QDialog.DialogCode.Accepted:
+			return
+		profile = dialog.result_profile
+		if profile == self.detection_profile:
+			return
+		if self.frame_index > 0 or self.events or self.waterfall_events or self.project_timeline or self.project_score:
+			answer = QMessageBox.question(
+				self, "Restart detection",
+				"Changing the detection profile restarts tracking and discards detection results "
+				"and timeline/score edits. Save your project first. Continue?",
+			)
+			if answer != QMessageBox.StandardButton.Yes:
+				return
+		self.detection_profile = profile
+		self.project_detection_locked = False
+		self.restart()
 
 	def toggle_play(self) -> None:
 		if self.timer.isActive():
@@ -6099,9 +6185,16 @@ class PianoRollReaderWindow(QMainWindow):
 		return changed
 
 	def _update_waterfall_events(self, frame: np.ndarray, frame_number: int) -> None:
+		profile = self.detection_profile
+		white_hues, black_hues = waterfall_hues(profile)
 		if self.waterfall_tracker is None:
-			self.waterfall_tracker = WaterfallTracker(strike_line(frame.shape[0]))
-		segments = waterfall_segments(frame, self.keys, self.key_width)
+			self.waterfall_tracker = WaterfallTracker(strike_line(
+				frame.shape[0], profile["keyboard_fraction"], profile["line_offset"]
+			))
+		segments = waterfall_segments(
+			frame, self.keys, self.key_width, profile["keyboard_fraction"],
+			white_hues, profile["line_offset"], black_hues,
+		)
 		self._apply_waterfall_actions(self.waterfall_tracker.update(frame_number, segments))
 
 	def _apply_waterfall_actions(self, actions: list[tuple[str, str, str, int]]) -> None:

@@ -27,25 +27,41 @@ MAX_DROPOUT_FRAMES = 2
 Segment = tuple[str, str, int, int]
 
 
-def strike_line(frame_height: int) -> int:
-	return round(frame_height * STRIKE_FRACTION) - LINE_ABOVE_STRIKE
+def strike_line(frame_height: int, keyboard_fraction: float | None = None, line_offset: int = LINE_ABOVE_STRIKE) -> int:
+	fraction = STRIKE_FRACTION if keyboard_fraction is None else keyboard_fraction
+	return round(frame_height * fraction) - line_offset
 
 
 def waterfall_segments(
-	frame: np.ndarray, keys: list[dict[str, object]], key_width: float
+	frame: np.ndarray, keys: list[dict[str, object]], key_width: float,
+	keyboard_fraction: float | None = None,
+	hand_hues: tuple = HAND_HUES,
+	line_offset: int = LINE_ABOVE_STRIKE,
+	black_hand_hues: tuple | None = None,
 ) -> list[Segment]:
 	"""(note, hand, top, bottom) of every bar piece near the keyboard, in frame rows."""
 	frame_height = frame.shape[0]
-	strike_y = round(frame_height * STRIKE_FRACTION)
-	search_top = max(0, strike_y - round(key_width * 2.5))
+	strike_y = round(frame_height * (STRIKE_FRACTION if keyboard_fraction is None else keyboard_fraction))
+	search_height = round(key_width * 2.5)
+	if line_offset != LINE_ABOVE_STRIKE:
+		search_height = max(search_height, line_offset + 5)
+	search_top = max(0, strike_y - search_height)
 	search_bottom = min(frame_height, strike_y + BAND_BELOW_STRIKE)
 	hsv = cv2.cvtColor(frame[search_top:search_bottom, :], cv2.COLOR_BGR2HSV)
 	key_centers = [
-		(str(key["note"]), float(key["bbox"][0]) + float(key["bbox"][2]) / 2)
+		(str(key["note"]), float(key["bbox"][0]) + float(key["bbox"][2]) / 2, key["kind"])
 		for key in keys
 	]
 	segments: list[Segment] = []
-	for hand, (low, high) in HAND_HUES:
+	black_by_hand = dict(black_hand_hues if black_hand_hues is not None else hand_hues)
+	ranges = []
+	for hand, white_range in hand_hues:
+		black_range = black_by_hand[hand]
+		if tuple(white_range) == tuple(black_range):
+			ranges.append((hand, white_range, None))
+		else:
+			ranges.extend(((hand, white_range, "white"), (hand, black_range, "black")))
+	for hand, (low, high), kind in ranges:
 		mask = (
 			(hsv[:, :, 1] > 120)
 			& (hsv[:, :, 2] > 100)
@@ -58,8 +74,8 @@ def waterfall_segments(
 			if not (0.55 * key_width <= width <= 1.6 * key_width and height >= 5 and area >= 35):
 				continue
 			center = x + width / 2
-			note, key_center = min(key_centers, key=lambda item: abs(item[1] - center))
-			if abs(key_center - center) <= key_width * 0.48:
+			note, key_center, key_kind = min(key_centers, key=lambda item: abs(item[1] - center))
+			if (kind is None or kind == key_kind) and abs(key_center - center) <= key_width * 0.48:
 				segments.append((note, hand, search_top + y, search_top + y + height - 1))
 	return segments
 

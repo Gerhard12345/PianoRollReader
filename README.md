@@ -1,6 +1,55 @@
 # PianoRollReader
 
+## Detection profiles
+
+Open a video and choose **Detection profile** to adapt detection without
+changing the built-in **Original** profile. Move the frame slider to a passage
+with visible pressed keys and falling bars. Choose a sample mode and click a
+clearly colored key or bar for each hand and key color (white or black); each
+click suggests a separate hue range and, for keys, a minimum saturation;
+both can also be edited manually. Pale colored keys can be sampled, but
+near-gray pixels still cannot provide a reliable hand color. For
+bar samples, choose the key color that the bar corresponds to. OpenCV hue
+values are 0–179. The preview shows detected keys and waterfall segments.
+Existing profiles use their original range for both key colors until changed.
+
+Choose **Place keyboard line**, then click or drag on the keyboard's upper edge.
+The yellow line marks that position and the red line is the waterfall tracking
+line; adjust its pixel offset if necessary. The original fixed position remains
+available. Check several frames and listen to the result: the preview shows
+individual frames, not complete note onsets, offsets, or repeated hits.
+
+Use **Save as...** to save a named profile for reuse, select it from the
+profile list, and press **OK** to apply it. The Original profile cannot be
+overwritten or deleted. Unsaved changes can also be applied to the current
+video. Applying a changed profile restarts tracking; a confirmation warns
+before existing detection results and timeline/score edits are discarded.
+Save the current project first if you need to keep them.
+
+For the Sacrifice video, a useful starting point is right-key and right-bar
+hue ranges of 40–80 for both key colors, a keyboard position around 78.70%, and the default
+18-pixel tracking offset. Verify and refine the settings on multiple passages.
+Profiles adjust highlight and waterfall detection; keyboard key contours are
+still calibrated from the first frame and require the expected 88-key layout.
+
 ## Score editing and export
+
+Choose the score's key signature from the **Key signature** dropdown (major
+and minor keys up to seven sharps or flats). Changing it on an existing score
+re-renders the notation without regenerating notes from the source or
+discarding edits, tuplets or reviewed measures. MIDI pitches do not change.
+Spelling is based on the key signature rather than harmonic context; manual
+enharmonic choices are not retained when rendering. Old projects default to
+C major. Projects with a non-default key use version 6 and cannot be opened
+by older releases.
+
+The score BPM can be set from 20 to 300 before generating the score. For
+normalized or quantized sources, their existing rhythmic positions are
+preserved while their playback timing is scaled to the chosen score BPM.
+Raw detection and editable-copy timings instead remain in seconds and are
+interpreted on the chosen BPM grid. Normalized sources are still computed
+using the 160 BPM reference; changing score BPM does not re-track the video
+or change the normalization's underlying beat decisions.
 
 Right-click a measure and choose **Edit bar**. Select a note or rest to choose
 the hand and edit target. **Edit LilyPond for selected hand** opens the
@@ -45,7 +94,15 @@ has moved, select it when opening the project. LilyPond is required to
 re-render a saved score.
 Existing version-1 projects remain supported. Projects containing tuplets are
 saved as version 2 so older releases reject them instead of silently losing
-their rhythmic notation.
+their rhythmic notation. Projects using a custom detection profile are saved
+as version 3 and contain a copy of the profile, independent of the reusable
+profiles stored in application settings. Older releases cannot open version 3.
+Projects without a profile use the Original settings.
+Projects with separate black-key color ranges use version 4; older releases
+cannot open them. Previously saved version-3 profiles remain compatible.
+Profiles with customized key saturation thresholds require project version 5.
+Earlier versions cannot open these projects; older profiles keep the original
+saturation threshold.
 
 While LilyPond renders, the score dialog shows an activity bar (not a
 percentage). Rendering may be cancelled and retried without discarding the

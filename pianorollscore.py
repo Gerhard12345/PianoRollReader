@@ -23,6 +23,26 @@ if TYPE_CHECKING:
 
 SLOTS_PER_MEASURE = 16
 PITCH_NAMES = ["c", "cis", "d", "dis", "e", "f", "fis", "g", "gis", "a", "ais", "b"]
+KEY_SIGNATURES = (
+	("Ces-Dur", "ces major", -7), ("Ges-Dur", "ges major", -6),
+	("Des-Dur", "des major", -5), ("As-Dur", "as major", -4),
+	("Es-Dur", "es major", -3), ("B-Dur", "bes major", -2),
+	("F-Dur", "f major", -1), ("C-Dur", "c major", 0),
+	("G-Dur", "g major", 1), ("D-Dur", "d major", 2),
+	("A-Dur", "a major", 3), ("E-Dur", "e major", 4),
+	("H-Dur", "b major", 5), ("Fis-Dur", "fis major", 6),
+	("Cis-Dur", "cis major", 7),
+	("as-Moll", "as minor", -7), ("es-Moll", "es minor", -6),
+	("b-Moll", "bes minor", -5), ("f-Moll", "f minor", -4),
+	("c-Moll", "c minor", -3), ("g-Moll", "g minor", -2),
+	("d-Moll", "d minor", -1), ("a-Moll", "a minor", 0),
+	("e-Moll", "e minor", 1), ("h-Moll", "b minor", 2),
+	("fis-Moll", "fis minor", 3), ("cis-Moll", "cis minor", 4),
+	("gis-Moll", "gis minor", 5), ("dis-Moll", "dis minor", 6),
+	("ais-Moll", "ais minor", 7),
+)
+KEY_FIFTHS = {key: fifths for _, key, fifths in KEY_SIGNATURES}
+DEFAULT_KEY_SIGNATURE = "c major"
 DURATION_NAMES = {16: "1", 12: "2.", 8: "2", 6: "4.", 4: "4", 3: "8.", 2: "8", 1: "16"}
 SVG_NS = "{http://www.w3.org/2000/svg}"
 XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
@@ -47,10 +67,35 @@ def find_lilypond() -> str | None:
 	return sorted(candidates)[-1] if candidates else None
 
 
-def lilypond_pitch(midi_note: int) -> str:
-	marks = midi_note // 12 - 1 - 3
+def lilypond_pitch(midi_note: int, key_signature: str = DEFAULT_KEY_SIGNATURE) -> str:
+	if key_signature not in KEY_FIFTHS:
+		raise ValueError(f"Unknown key signature: {key_signature}")
+	fifths = KEY_FIFTHS[key_signature]
+	if fifths == 0:
+		name = PITCH_NAMES[midi_note % 12]
+		absolute = midi_note % 12
+	else:
+		naturals = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
+		order = "fcgdaeb" if fifths > 0 else "beadgcf"
+		altered = set(order[:abs(fifths)])
+		sign = 1 if fifths > 0 else -1
+		spellings = {}
+		for letter, value in naturals.items():
+			accidental = sign if letter in altered else 0
+			suffix = "is" if accidental > 0 else ("s" if letter in "ae" else "es") if accidental < 0 else ""
+			spellings[(value + accidental) % 12] = (letter + suffix, value + accidental)
+		pitch_class = midi_note % 12
+		if pitch_class in spellings:
+			name, absolute = spellings[pitch_class]
+		elif fifths < 0:
+			name = ("c", "des", "d", "es", "e", "f", "ges", "g", "as", "a", "bes", "b")[pitch_class]
+			absolute = pitch_class
+		else:
+			name = PITCH_NAMES[pitch_class]
+			absolute = pitch_class
+	marks = (midi_note - absolute) // 12 - 4
 	suffix = "'" * marks if marks > 0 else "," * -marks
-	return PITCH_NAMES[midi_note % 12] + suffix
+	return name + suffix
 
 
 def split_length(position: int, length: int, sounding: bool = False) -> list[int]:
@@ -126,6 +171,7 @@ def hand_pieces(notes: list[tuple[int, int, int]], total_slots: int) -> list[Pie
 
 def render_hand(
 	variable: str, clef: str, pieces: list[Piece], overrides: dict[int, ParsedNotation] | None = None,
+	key_signature: str = DEFAULT_KEY_SIGNATURE,
 ) -> tuple[str, dict[int, float], set[tuple[int, int]], dict[tuple[int, int], int]]:
 	"""Return the LilyPond text, a {line: slot} map, tie columns and {(line, column): pitch}."""
 	lines = [f"{variable} = {{", f"  \\clef {clef}"]
@@ -155,14 +201,14 @@ def render_hand(
 					offsets = []
 				elif len(event.pitches) == 1:
 					pitch = event.pitches[0]
-					text = lilypond_pitch(pitch) + event.written_duration + ("~" if pitch in event.ties else "")
+					text = lilypond_pitch(pitch, key_signature) + event.written_duration + ("~" if pitch in event.ties else "")
 					offsets = [(2, pitch)]
 				else:
 					tokens = []
 					offsets = []
 					position = 3
 					for pitch in event.pitches:
-						token = lilypond_pitch(pitch) + ("~" if pitch in event.ties else "")
+						token = lilypond_pitch(pitch, key_signature) + ("~" if pitch in event.ties else "")
 						tokens.append(token)
 						offsets.append((position, pitch))
 						position += len(token) + 1
@@ -182,13 +228,13 @@ def render_hand(
 			text = f"r{duration}"
 		elif len(piece.pitches) == 1:
 			pitch = piece.pitches[0]
-			text = lilypond_pitch(pitch) + duration + ("~" if pitch in piece.tied else "")
+			text = lilypond_pitch(pitch, key_signature) + duration + ("~" if pitch in piece.tied else "")
 			offsets.append((2, pitch))
 		else:
 			tokens = []
 			position = 3
 			for pitch in piece.pitches:
-				token = lilypond_pitch(pitch) + ("~" if pitch in piece.tied else "")
+				token = lilypond_pitch(pitch, key_signature) + ("~" if pitch in piece.tied else "")
 				tokens.append(token)
 				offsets.append((position, pitch))
 				position += len(token) + 1
@@ -219,6 +265,7 @@ class ScoreSource:
 	total_slots: int
 	measures: int
 	pitch_columns: dict[tuple[str, int, int], int] = field(default_factory=dict)
+	key_signature: str = DEFAULT_KEY_SIGNATURE
 
 
 def build_score(
@@ -229,6 +276,7 @@ def build_score(
 	base: str = "score",
 	first_bar: int | None = None,
 	measure_notation: dict[tuple[str, int], str] | None = None,
+	key_signature: str = DEFAULT_KEY_SIGNATURE,
 ) -> ScoreSource:
 	"""notes: dicts with hand ('left'/'right'), midi_note, start, end in seconds.
 
@@ -271,14 +319,18 @@ def build_score(
 	measures = max(1, -(-last_end // SLOTS_PER_MEASURE), max((bar + 1 for _, bar in overrides), default=0))
 	total_slots = measures * SLOTS_PER_MEASURE
 
+	if key_signature not in KEY_FIFTHS:
+		raise ValueError(f"Unknown key signature: {key_signature}")
 	right_name, left_name = f"{base}_right.ly", f"{base}_left.ly"
 	right_text, right_lines, right_ties, right_pitches = render_hand(
 		"rightHand", "treble", hand_pieces(converted["right"], total_slots),
 		{bar: notation for (hand, bar), notation in overrides.items() if hand == "right"},
+		key_signature,
 	)
 	left_text, left_lines, left_ties, left_pitches = render_hand(
 		"leftHand", "bass", hand_pieces(converted["left"], total_slots),
 		{bar: notation for (hand, bar), notation in overrides.items() if hand == "left"},
+		key_signature,
 	)
 	safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
 	if first_bar is None:
@@ -301,8 +353,8 @@ def build_score(
 		+ paper
 		+ "\\score {\n"
 		"  \\new PianoStaff <<\n"
-		f'    \\new Staff = "right" {{ \\tempo 4 = {bpm} \\time 4/4 \\rightHand }}\n'
-		'    \\new Staff = "left" { \\time 4/4 \\leftHand }\n'
+		f'    \\new Staff = "right" {{ \\tempo 4 = {bpm} \\time 4/4 \\key {key_signature.split()[0]} \\{key_signature.split()[1]} \\rightHand }}\n'
+		f'    \\new Staff = "left" {{ \\time 4/4 \\key {key_signature.split()[0]} \\{key_signature.split()[1]} \\leftHand }}\n'
 		"  >>\n"
 		"  \\layout {\n"
 		"    \\context {\n"
@@ -332,6 +384,7 @@ def build_score(
 		measures=measures,
 		pitch_columns={(right_name, *key): pitch for key, pitch in right_pitches.items()}
 		| {(left_name, *key): pitch for key, pitch in left_pitches.items()},
+		key_signature=key_signature,
 	)
 
 
